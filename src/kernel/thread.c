@@ -335,7 +335,11 @@ static void switchSchedContext(bool_t switchedDomain)
 static bool_t scheduleChooseNewThread(void)
 {
     bool_t switchedDomain = false;
+#ifdef CONFIG_KERNEL_MCS
+    if (isCurDomainExpired()) {
+#else
     if (ksDomainTime == 0) {
+#endif
         nextDomain();
         switchedDomain = true;
     }

@@ -118,7 +118,7 @@ static inline bool_t PURE isRoundRobin(sched_context_t *sc)
 static inline bool_t isCurDomainExpired(void)
 {
     return CONFIG_NUM_DOMAINS > 1 &&
-           ksDomainTime < (NODE_STATE(ksConsumed) + MIN_BUDGET);
+           ksDomainTime < NODE_STATE(ksConsumed);
 }
 
 static inline void commitTime(bool_t switchedDomain)
