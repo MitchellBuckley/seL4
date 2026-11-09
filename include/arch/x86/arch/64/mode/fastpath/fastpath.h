@@ -29,7 +29,7 @@ static inline vspace_root_t *cap_vtable_cap_get_vspace_root_fp(cap_t vtable_cap)
     return PML4E_PTR(vtable_cap.words[1]);
 }
 
-static inline word_t cap_pml4_cap_get_capPML4MappedASID_fp(cap_t vtable_cap)
+static inline word_t vspace_root_getMappedASID_fp(cap_t vtable_cap)
 {
     return (uint32_t)vtable_cap.words[0];
 }
@@ -51,6 +51,8 @@ static inline void FORCE_INLINE switchToThread_fp(tcb_t *thread, vspace_root_t *
                  : [value] "r"(&thread->tcbArch.tcbContext.registers[Error + 1]),
                  [offset] "i"(OFFSETOF(nodeInfo_t, currentThreadUserContext)));
 #endif /* ENABLE_SMP_SUPPORT */
+
+    lazyFPURestore(thread);
 
     if (config_set(CONFIG_KERNEL_X86_IBPB_ON_CONTEXT_SWITCH)) {
         x86_ibpb();
@@ -129,9 +131,9 @@ static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t m
          */
         restore_user_context();
     }
-    NODE_UNLOCK;
     c_exit_hook();
-    lazyFPURestore(cur_thread);
+
+    NODE_UNLOCK;
 
     if (config_set(CONFIG_KERNEL_SKIM_WINDOW)) {
         /* see restore_user_context for a full explanation of why we do this */
@@ -203,7 +205,7 @@ static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t m
 #endif /* CONFIG_KERNEL_SKIM_WINDOW */
 #endif /* defined(ENABLE_SMP_SUPPORT) && defined(CONFIG_KERNEL_SKIM_WINDOW) */
             "sti\n"
-            "sysexitq\n"
+            SYSEXITQ"\n"
             :
             : "c"(&cur_thread->tcbArch.tcbContext.registers[RAX]),
             "D"(badge),

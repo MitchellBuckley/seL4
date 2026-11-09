@@ -36,10 +36,6 @@ NODE_STATE_DECLARE(interrupt_t, x86KSPendingInterrupt);
 /* Bitmask of all cores should receive the reschedule IPI */
 NODE_STATE_DECLARE(word_t, ipiReschedulePending);
 
-#ifdef CONFIG_VTX
-NODE_STATE_DECLARE(vcpu_t *, x86KSCurrentVCPU);
-#endif
-
 NODE_STATE_DECLARE(word_t, x86KSCurrentFSBase);
 NODE_STATE_DECLARE(word_t, x86KSCurrentGSBase);
 
@@ -49,6 +45,12 @@ NODE_STATE_DECLARE(word_t, x86KSCurrentGSBase);
 NODE_STATE_DECLARE(word_t, x86KSGPExceptReturnTo);
 
 NODE_STATE_TYPE_DECLARE(modeNodeState, mode);
+
+#ifdef CONFIG_VTX
+NODE_STATE_DECLARE(vcpu_t *, x86KSCurrentVCPU);
+NODE_STATE_DECLARE(struct vmxon_region, x86KSVMXOnRegion);
+#endif
+
 NODE_STATE_END(archNodeState);
 
 /* this is per core state grouped into a separate struct as it needs to be available
@@ -81,7 +83,7 @@ extern uint32_t x86KSFirstValidIODomain;
 #ifdef CONFIG_PRINTING
 extern uint16_t x86KSconsolePort;
 #endif
-#ifdef CONFIG_DEBUG_BUILD
+#if defined(CONFIG_PRINTING) || defined(CONFIG_DEBUG_BUILD)
 extern uint16_t x86KSdebugPort;
 #endif
 

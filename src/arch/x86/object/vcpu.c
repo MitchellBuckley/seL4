@@ -25,11 +25,14 @@
 #define VMX_EXIT_QUAL_TYPE_CLTS 2
 #define VMX_EXIT_QUAL_TYPE_LMSW 3
 
-#define VMXON_REGION_SIZE 4096
-
 const vcpu_gp_register_t crExitRegs[] = {
-    VCPU_EAX, VCPU_ECX, VCPU_EDX, VCPU_EBX, VCPU_ESP, VCPU_EBP, VCPU_ESI, VCPU_EDI
+    VCPU_EAX, VCPU_ECX, VCPU_EDX, VCPU_EBX, VCPU_ESP, VCPU_EBP, VCPU_ESI, VCPU_EDI,
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    VCPU_R8, VCPU_R9, VCPU_R10, VCPU_R11, VCPU_R12, VCPU_R13, VCPU_R14, VCPU_R15,
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
 };
+
+#define MSR_BITMAP_MASK(x) ((x) & 0x1fff)
 
 typedef struct msr_bitmap {
     word_t bitmap[0x2000 / sizeof(word_t) / 8];
@@ -42,14 +45,9 @@ typedef struct msr_bitmaps {
     msr_bitmap_t high_msr_write;
 } msr_bitmaps_t;
 
-static struct PACKED {
-    uint32_t revision;
-    char data[VMXON_REGION_SIZE - sizeof(uint32_t)];
-} vmxon_region ALIGN(VMXON_REGION_SIZE);
-
 static msr_bitmaps_t msr_bitmap_region ALIGN(BIT(seL4_PageBits));
 
-static char null_ept_space[seL4_PageBits] ALIGN(BIT(seL4_PageBits));
+static char null_ept_space[BIT(seL4_PageBits)] ALIGN(BIT(seL4_PageBits));
 
 /* Cached value of the hardware defined vmcs revision */
 static uint32_t vmcs_revision;
@@ -82,6 +80,8 @@ static bool_t vmx_feature_ack_on_exit;
 
 static vcpu_t *x86KSVPIDTable[VPID_LAST + 1];
 static vpid_t x86KSNextVPID = VPID_FIRST;
+
+static void releaseVPID(vpid_t vpid);
 
 static inline bool_t vmxon(paddr_t vmxon_region)
 {
@@ -117,6 +117,10 @@ void clearCurrentVCPU(void)
         vmclear(vcpu);
         vcpu->launched = false;
         ARCH_NODE_STATE(x86KSCurrentVCPU) = NULL;
+        if (vcpu->fpu_active && vcpu->vcpuTCB) {
+            fpuRelease(vcpu->vcpuTCB);
+            vcpu->fpu_active = false;
+        }
     }
 }
 
@@ -132,10 +136,25 @@ static void vmptrld(void *vmcs_ptr)
         : "cc"
     );
     /* The usage of vmptrld should be correct by construction. As there is no
-     * capacity to propogate errors where vmptrld is used we will do our best
+     * capacity to propagate errors where vmptrld is used we will do our best
      * to detect bugs in debug builds by asserting */
     assert(!error);
 }
+
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+void vcpu_restore_guest_msrs(vcpu_t *vcpu)
+{
+    x86_wrmsr(IA32_STAR_MSR, vcpu->syscall_registers[VCPU_STAR]);
+    x86_wrmsr(IA32_LSTAR_MSR, vcpu->syscall_registers[VCPU_LSTAR]);
+    x86_wrmsr(IA32_CSTAR_MSR, vcpu->syscall_registers[VCPU_CSTAR]);
+    x86_wrmsr(IA32_FMASK_MSR, vcpu->syscall_registers[VCPU_SYSCALL_MASK]);
+}
+
+void vcpu_restore_host_msrs(void)
+{
+    init_syscall_msrs();
+}
+#endif
 
 static void switchVCPU(vcpu_t *vcpu)
 {
@@ -238,7 +257,7 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
         BIT(21);    //Load host IA32_EFER
 #ifdef CONFIG_ARCH_X86_64
     exit_control_mask |= BIT(9); //Host address-space size
-#endif
+#endif /* CONFIG_ARCH_X86_64 */
     /* Read out the fixed high and low bits from the MSRs */
     uint32_t pinbased_ctls;
     uint32_t procbased_ctls;
@@ -271,10 +290,25 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
     cr4_high = x86_rdmsr_low(IA32_VMX_CR4_FIXED0_MSR);
     cr4_low = x86_rdmsr_low(IA32_VMX_CR4_FIXED1_MSR);
 
+    /* "Unrestricted guest" is a userspace controlled setting that determines whether the VCPU
+     * may run in unpaged protected mode or in real-address mode. If the host CPU supports this feature, then
+     * CR0.PE and CR0.PG may be 0 while the VCPU is running: */
+
+    /* Intel SDM Combined Volumes
+     * Order Number: 325462-090US February 2026
+     * Chapter 26.8 "RESTRICTIONS ON VMX OPERATION"
+     * > Later processors support a VM-execution control called “unrestricted guest” (see Section 27.6.2).
+     * > If this control is 1, CR0.PE and CR0.PG may be 0 in VMX non-root operation (even if the capability
+     * > MSR IA32_VMX_CR0_FIXED0 reports otherwise). Such processors allow guest software to run in
+     * > unpaged protected mode or in real-address mode. */
+    if (secondary_control_low & BIT(7)) {
+        cr0_high &= ~(CR0_PE | CR0_PG);
+    }
+
     /* Check for VPID support */
     if (!(secondary_control_low & BIT(5))) {
         vmx_feature_vpid = 0;
-        printf("vt-x: VPIDs are not supported. Expect performance degredation\n");
+        printf("vt-x: VPIDs are not supported. Expect performance degradation\n");
     } else {
         vmx_feature_vpid = 1;
         secondary_control_mask |= BIT(5);
@@ -292,7 +326,7 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
     /* Check for external interrupt exiting */
     if (!(exit_control_low & BIT(15))) {
         vmx_feature_ack_on_exit = 0;
-        printf("vt-x: Interrupt ack on exit not supported. Expect performance degredation\n");
+        printf("vt-x: Interrupt ack on exit not supported. Expect performance degradation\n");
     } else {
         vmx_feature_ack_on_exit = 1;
         exit_control_mask |= BIT(15);
@@ -320,6 +354,13 @@ static bool_t BOOT_CODE init_vtx_fixed_values(bool_t useTrueMsrs)
         printf("vt-x: Unsupported exit control features %lx\n", (long)missing);
         return false;
     }
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    missing = (~entry_control_low) & BIT(9);
+    if (missing) {
+        printf("vt-x: CPU does not support 64-bit guests\n");
+        return false;
+    }
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
 
     /* Force the bits we require to be high */
     pin_control_high |= pin_control_mask;
@@ -363,6 +404,11 @@ static bool_t BOOT_CODE check_vtx_fixed_values(bool_t useTrueMsrs)
     uint32_t local_cr4_high = x86_rdmsr_low(IA32_VMX_CR4_FIXED0_MSR);
     uint32_t local_cr4_low = x86_rdmsr_low(IA32_VMX_CR4_FIXED1_MSR);
 
+    /* See "init_vtx_fixed_values" */
+    if (local_secondary_control_low & BIT(7)) {
+        local_cr0_high &= ~(CR0_PE | CR0_PG);
+    }
+
     /* We want to check that any bits that there are no bits that this core
      * requires to be high, that the BSP did not require to be high. This can
      * be checked with 'local_high & high == local_high'.
@@ -398,10 +444,10 @@ void vcpu_init(vcpu_t *vcpu)
 {
     vcpu->vcpuTCB = NULL;
     vcpu->launched = false;
+    vcpu->fpu_active = false;
+    vcpu->fpuState = x86KSnullFpuState;
 
     memcpy(vcpu->vmcs, &vmcs_revision, 4);
-
-    switchVCPU(vcpu);
 
     vcpu->cr0 = cr0_high & cr0_low;
     vcpu->cr0_shadow = 0;
@@ -411,6 +457,8 @@ void vcpu_init(vcpu_t *vcpu)
 #ifdef ENABLE_SMP_SUPPORT
     vcpu->last_cpu = getCurrentCPUIndex();
 #endif /* ENABLE_SMP_SUPPORT */
+
+    switchVCPU(vcpu);
 
     vmwrite(VMX_HOST_PAT, x86_rdmsr(IA32_PAT_MSR));
     vmwrite(VMX_HOST_EFER, x86_rdmsr(IA32_EFER_MSR));
@@ -455,7 +503,15 @@ void vcpu_init(vcpu_t *vcpu)
     vmwrite(VMX_CONTROL_PRIMARY_PROCESSOR_CONTROLS, primary_control_high & primary_control_low);
     vmwrite(VMX_CONTROL_SECONDARY_PROCESSOR_CONTROLS, secondary_control_high & secondary_control_low);
     vmwrite(VMX_CONTROL_EXIT_CONTROLS, exit_control_high & exit_control_low);
-    vmwrite(VMX_CONTROL_ENTRY_CONTROLS, entry_control_high & entry_control_low);
+
+    uint64_t entry_control = entry_control_high & entry_control_low;
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    /* Put VCPU in IA-32e mode after VM entry for backward compatibility with previous versions of seL4.
+     * This bit can be zero'ed by userspace to enter in other modes. */
+    entry_control |= BIT(9);
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
+    vmwrite(VMX_CONTROL_ENTRY_CONTROLS, entry_control);
+
     vmwrite(VMX_CONTROL_MSR_ADDRESS, (word_t)kpptr_to_paddr(&msr_bitmap_region));
     vmwrite(VMX_GUEST_CR0, vcpu->cr0);
     vmwrite(VMX_GUEST_CR4, cr4_high & cr4_low);
@@ -472,15 +528,14 @@ static void dissociateVcpuTcb(tcb_t *tcb, vcpu_t *vcpu)
 {
     assert(tcb->tcbArch.tcbVCPU == vcpu);
     assert(vcpu->vcpuTCB == tcb);
+    fpuRelease(tcb);
+    vcpu->fpu_active = false;
     tcb->tcbArch.tcbVCPU = NULL;
     vcpu->vcpuTCB = NULL;
 }
 
 void vcpu_finalise(vcpu_t *vcpu)
 {
-    if (vcpu->vcpuTCB) {
-        dissociateVcpuTcb(vcpu->vcpuTCB, vcpu);
-    }
     if (ARCH_NODE_STATE_ON_CORE(x86KSCurrentVCPU, vcpu->last_cpu) == vcpu) {
 #ifdef ENABLE_SMP_SUPPORT
         if (vcpu->last_cpu != getCurrentCPUIndex()) {
@@ -490,6 +545,12 @@ void vcpu_finalise(vcpu_t *vcpu)
         {
             clearCurrentVCPU();
         }
+    }
+    if (vcpu->vcpuTCB) {
+        dissociateVcpuTcb(vcpu->vcpuTCB, vcpu);
+    }
+    if (vcpu->vpid != VPID_INVALID) {
+        releaseVPID(vcpu->vpid);
     }
 }
 
@@ -517,13 +578,127 @@ static exception_t invokeVCPUWriteRegisters(vcpu_t *vcpu, word_t *buffer)
 
 static exception_t decodeVCPUWriteRegisters(cap_t cap, word_t length, word_t *buffer)
 {
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    if (length < 15) {
+#else
     if (length < 7) {
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
         userError("VCPU WriteRegisters: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
     }
     return invokeVCPUWriteRegisters(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)), buffer);
 }
+
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+static exception_t invokeWriteMSR(vcpu_t *vcpu, word_t *buffer, word_t field, word_t value)
+{
+    tcb_t *thread;
+    thread = NODE_STATE(ksCurThread);
+    if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
+        switchVCPU(vcpu);
+    }
+    switch (field) {
+    case IA32_LSTAR_MSR:
+        vcpu->syscall_registers[VCPU_LSTAR] = value;
+        break;
+    case IA32_STAR_MSR:
+        vcpu->syscall_registers[VCPU_STAR] = value;
+        break;
+    case IA32_CSTAR_MSR:
+        vcpu->syscall_registers[VCPU_CSTAR] = value;
+        break;
+    case IA32_FMASK_MSR:
+        vcpu->syscall_registers[VCPU_SYSCALL_MASK] = value;
+        break;
+    }
+    setMR(thread, buffer, 0, value);
+    setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
+    return EXCEPTION_NONE;
+}
+
+static exception_t decodeVCPUWriteMSR(cap_t cap, word_t length, word_t *buffer)
+{
+    word_t field;
+    word_t value;
+
+    if (length < 2) {
+        userError("VCPU WriteMSR: Not enough arguments.");
+        current_syscall_error.type = seL4_IllegalOperation;
+        return EXCEPTION_SYSCALL_ERROR;
+    }
+
+    field = getSyscallArg(0, buffer);
+    value = getSyscallArg(1, buffer);
+    switch (field) {
+    case IA32_LSTAR_MSR:
+    case IA32_STAR_MSR:
+    case IA32_CSTAR_MSR:
+    case IA32_FMASK_MSR:
+        break;
+    default:
+        userError("VCPU WriteMSR: Invalid field %lx.", (long)field);
+        current_syscall_error.type = seL4_IllegalOperation;
+        return EXCEPTION_SYSCALL_ERROR;
+    }
+    return invokeWriteMSR(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)), buffer, field, value);
+}
+
+static exception_t invokeReadMSR(vcpu_t *vcpu, word_t field, word_t *buffer)
+{
+    tcb_t *thread;
+    thread = NODE_STATE(ksCurThread);
+
+    word_t value = 0;
+
+    switch (field) {
+    case IA32_LSTAR_MSR:
+        value = vcpu->syscall_registers[VCPU_LSTAR];
+        break;
+    case IA32_STAR_MSR:
+        value = vcpu->syscall_registers[VCPU_STAR];
+        break;
+    case IA32_CSTAR_MSR:
+        value = vcpu->syscall_registers[VCPU_CSTAR];
+        break;
+    case IA32_FMASK_MSR:
+        value = vcpu->syscall_registers[VCPU_SYSCALL_MASK];
+        break;
+    case IA32_VMX_MISC_MSR:
+        value = x86_rdmsr(field);
+        break;
+    }
+
+    setMR(thread, buffer, 0, value);
+    setRegister(thread, msgInfoRegister, wordFromMessageInfo(
+                    seL4_MessageInfo_new(0, 0, 0, 1)));
+    setThreadState(thread, ThreadState_Restart);
+    return EXCEPTION_NONE;
+}
+
+static exception_t decodeVCPUReadMSR(cap_t cap, word_t length, word_t *buffer)
+{
+    if (length < 1) {
+        userError("VCPU ReadMSR: Not enough arguments.");
+        current_syscall_error.type = seL4_IllegalOperation;
+        return EXCEPTION_SYSCALL_ERROR;
+    }
+    word_t field = getSyscallArg(0, buffer);
+    switch (field) {
+    case IA32_LSTAR_MSR:
+    case IA32_STAR_MSR:
+    case IA32_CSTAR_MSR:
+    case IA32_FMASK_MSR:
+    case IA32_VMX_MISC_MSR:
+        break;
+    default:
+        userError("VCPU ReadMSR: Invalid field %lx.", (long)field);
+        current_syscall_error.type = seL4_IllegalOperation;
+        return EXCEPTION_SYSCALL_ERROR;
+    }
+    return invokeReadMSR(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)), field, buffer);
+}
+#endif  /* CONFIG_X86_64_VTX_64BIT_GUESTS */
 
 static exception_t invokeEnableIOPort(vcpu_t *vcpu, cte_t *slot, cap_t cap, uint16_t low, uint16_t high)
 {
@@ -540,7 +715,7 @@ static exception_t invokeEnableIOPort(vcpu_t *vcpu, cte_t *slot, cap_t cap, uint
     return EXCEPTION_NONE;
 }
 
-static exception_t decodeEnableIOPort(cap_t cap, word_t length, word_t *buffer, extra_caps_t excaps)
+static exception_t decodeEnableIOPort(cap_t cap, word_t length, word_t *buffer)
 {
     vcpu_t *vcpu;
     cap_t ioCap;
@@ -552,13 +727,13 @@ static exception_t decodeEnableIOPort(cap_t cap, word_t length, word_t *buffer, 
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
     }
-    if (excaps.excaprefs[0] == NULL) {
+    if (current_extra_caps.excaprefs[0] == NULL) {
         userError("VCPU EnableIOPort: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
     }
-    ioSlot = excaps.excaprefs[0];
-    ioCap  = excaps.excaprefs[0]->cap;
+    ioSlot = current_extra_caps.excaprefs[0];
+    ioCap  = current_extra_caps.excaprefs[0]->cap;
 
     if (cap_get_capType(ioCap) != cap_io_port_cap) {
         userError("VCPU EnableIOPort: IOPort cap is not a IOPort cap.");
@@ -608,10 +783,11 @@ static exception_t decodeDisableIOPort(cap_t cap, word_t length, word_t *buffer)
     return invokeDisableIOPort(vcpu, low, high);
 }
 
-static exception_t invokeWriteVMCS(vcpu_t *vcpu, word_t *buffer, word_t field, word_t value)
+static exception_t invokeWriteVMCS(vcpu_t *vcpu, bool_t call, word_t *buffer, word_t field, word_t value)
 {
     tcb_t *thread;
     thread = NODE_STATE(ksCurThread);
+
     if (ARCH_NODE_STATE(x86KSCurrentVCPU) != vcpu) {
         switchVCPU(vcpu);
     }
@@ -629,13 +805,19 @@ static exception_t invokeWriteVMCS(vcpu_t *vcpu, word_t *buffer, word_t field, w
         vcpu->cr0_shadow = vcpu->cached_cr0_shadow = value;
         break;
     }
-    setMR(thread, buffer, 0, value);
     vmwrite(field, value);
-    setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
+
+    if (call) {
+        setRegister(thread, badgeRegister, 0);
+        unsigned int length = setMR(thread, buffer, 0, value);
+        setRegister(thread, msgInfoRegister, wordFromMessageInfo(
+                        seL4_MessageInfo_new(0, 0, 0, length)));
+    }
+    setThreadState(NODE_STATE(ksCurThread), ThreadState_Running);
     return EXCEPTION_NONE;
 }
 
-static exception_t decodeWriteVMCS(cap_t cap, word_t length, word_t *buffer)
+static exception_t decodeWriteVMCS(cap_t cap, word_t length, bool_t call, word_t *buffer)
 {
     word_t field;
     word_t value;
@@ -723,6 +905,9 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, word_t *buffer)
     case VMX_CONTROL_SECONDARY_PROCESSOR_CONTROLS:
         value = applyFixedBits(value, secondary_control_high, secondary_control_low);
         break;
+    case VMX_CONTROL_ENTRY_CONTROLS:
+        value = applyFixedBits(value, entry_control_high, entry_control_low);
+        break;
     case VMX_CONTROL_EXIT_CONTROLS:
         value = applyFixedBits(value, exit_control_high, exit_control_low);
         break;
@@ -737,7 +922,7 @@ static exception_t decodeWriteVMCS(cap_t cap, word_t length, word_t *buffer)
         current_syscall_error.type = seL4_IllegalOperation;
         return EXCEPTION_SYSCALL_ERROR;
     }
-    return invokeWriteVMCS(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)), buffer, field, value);
+    return invokeWriteVMCS(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)), call, buffer, field, value);
 }
 
 static word_t readVMCSField(vcpu_t *vcpu, word_t field)
@@ -758,19 +943,22 @@ static word_t readVMCSField(vcpu_t *vcpu, word_t field)
     return vmread(field);
 }
 
-static exception_t invokeReadVMCS(vcpu_t *vcpu, word_t field, word_t *buffer)
+static exception_t invokeReadVMCS(vcpu_t *vcpu, word_t field, bool_t call, word_t *buffer)
 {
     tcb_t *thread;
     thread = NODE_STATE(ksCurThread);
-
-    setMR(thread, buffer, 0, readVMCSField(vcpu, field));
-    setRegister(thread, msgInfoRegister, wordFromMessageInfo(
-                    seL4_MessageInfo_new(0, 0, 0, 1)));
-    setThreadState(thread, ThreadState_Restart);
+    word_t value = readVMCSField(vcpu, field);
+    if (call) {
+        setRegister(thread, badgeRegister, 0);
+        unsigned int length = setMR(thread, buffer, 0, value);
+        setRegister(thread, msgInfoRegister, wordFromMessageInfo(
+                        seL4_MessageInfo_new(0, 0, 0, length)));
+    }
+    setThreadState(NODE_STATE(ksCurThread), ThreadState_Running);
     return EXCEPTION_NONE;
 }
 
-static exception_t decodeReadVMCS(cap_t cap, word_t length, word_t *buffer)
+static exception_t decodeReadVMCS(cap_t cap, word_t length, bool_t call, word_t *buffer)
 {
     if (length < 1) {
         userError("VCPU ReadVMCS: Not enough arguments.");
@@ -855,7 +1043,9 @@ static exception_t decodeReadVMCS(cap_t cap, word_t length, word_t *buffer)
     case VMX_CONTROL_ENTRY_INTERRUPTION_INFO:
     case VMX_CONTROL_PIN_EXECUTION_CONTROLS:
     case VMX_CONTROL_PRIMARY_PROCESSOR_CONTROLS:
+    case VMX_CONTROL_SECONDARY_PROCESSOR_CONTROLS:
     case VMX_CONTROL_EXCEPTION_BITMAP:
+    case VMX_CONTROL_ENTRY_CONTROLS:
     case VMX_CONTROL_EXIT_CONTROLS:
     case VMX_GUEST_CR0:
     case VMX_GUEST_CR3:
@@ -866,7 +1056,7 @@ static exception_t decodeReadVMCS(cap_t cap, word_t length, word_t *buffer)
         current_syscall_error.type = seL4_IllegalOperation;
         return EXCEPTION_SYSCALL_ERROR;
     }
-    return invokeReadVMCS(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)), field, buffer);
+    return invokeReadVMCS(VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap)), field, call, buffer);
 }
 
 static exception_t invokeSetTCB(vcpu_t *vcpu, tcb_t *tcb)
@@ -877,15 +1067,15 @@ static exception_t invokeSetTCB(vcpu_t *vcpu, tcb_t *tcb)
     return EXCEPTION_NONE;
 }
 
-static exception_t decodeSetTCB(cap_t cap, word_t length, word_t *buffer, extra_caps_t excaps)
+static exception_t decodeSetTCB(cap_t cap, word_t length, word_t *buffer)
 {
     cap_t tcbCap;
-    if (excaps.excaprefs[0] == NULL) {
+    if (current_extra_caps.excaprefs[0] == NULL) {
         userError("VCPU SetTCB: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
     }
-    tcbCap  = excaps.excaprefs[0]->cap;
+    tcbCap  = current_extra_caps.excaprefs[0]->cap;
 
     if (cap_get_capType(tcbCap) != cap_thread_cap) {
         userError("TCB cap is not a TCB cap.");
@@ -930,7 +1120,8 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb)
     setMR(tcb, buffer, SEL4_VMENTER_CALL_EIP_MR, vmread(VMX_GUEST_RIP));
     setMR(tcb, buffer, SEL4_VMENTER_CALL_CONTROL_PPC_MR, vmread(VMX_CONTROL_PRIMARY_PROCESSOR_CONTROLS));
 
-    setMR(tcb, buffer, SEL4_VMENTER_CALL_CONTROL_ENTRY_MR, vmread(VMX_CONTROL_ENTRY_INTERRUPTION_INFO));
+    setMR(tcb, buffer, SEL4_VMENTER_CALL_INTERRUPT_INFO_MR,
+          vmread(VMX_CONTROL_ENTRY_INTERRUPTION_INFO));
     setRegister(tcb, msgInfoRegister, 0);
 }
 
@@ -940,23 +1131,29 @@ exception_t decodeX86VCPUInvocation(
     cptr_t cptr,
     cte_t *slot,
     cap_t cap,
-    extra_caps_t excaps,
+    bool_t call,
     word_t *buffer
 )
 {
     switch (invLabel) {
     case X86VCPUSetTCB:
-        return decodeSetTCB(cap, length, buffer, excaps);
+        return decodeSetTCB(cap, length, buffer);
     case X86VCPUReadVMCS:
-        return decodeReadVMCS(cap, length, buffer);
+        return decodeReadVMCS(cap, length, call, buffer);
     case X86VCPUWriteVMCS:
-        return decodeWriteVMCS(cap, length, buffer);
+        return decodeWriteVMCS(cap, length, call, buffer);
     case X86VCPUEnableIOPort:
-        return decodeEnableIOPort(cap, length, buffer, excaps);
+        return decodeEnableIOPort(cap, length, buffer);
     case X86VCPUDisableIOPort:
         return decodeDisableIOPort(cap, length, buffer);
     case X86VCPUWriteRegisters:
         return decodeVCPUWriteRegisters(cap, length, buffer);
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    case X86VCPUWriteMSR:
+        return decodeVCPUWriteMSR(cap, length, buffer);
+    case X86VCPUReadMSR:
+        return decodeVCPUReadMSR(cap, length, buffer);
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
     default:
         userError("VCPU: Illegal operation.");
         current_syscall_error.type = seL4_IllegalOperation;
@@ -1006,7 +1203,7 @@ BOOT_CODE bool_t vtx_init(void)
     }
     /* Initialize the fixed values only on the boot core. All other cores
      * will just check that the fixed values are valid */
-    if (SMP_TERNARY(getCurrentCPUIndex(), 0) == 0) {
+    if (CURRENT_CPU_INDEX() == 0) {
         if (!init_vtx_fixed_values(vmx_basic_msr_get_true_msrs(vmx_basic))) {
             printf("vt-x: lack of required features\n");
             return false;
@@ -1018,13 +1215,14 @@ BOOT_CODE bool_t vtx_init(void)
     }
     write_cr4(read_cr4() | CR4_VMXE);
     /* we are required to set the VMCS region in the VMXON region */
-    vmxon_region.revision = vmcs_revision;
+    struct vmxon_region *vmxon_kptr = &ARCH_NODE_STATE(x86KSVMXOnRegion);
+    vmxon_kptr->revision = vmcs_revision;
     /* Before calling vmxon, we must check that CR0 and CR4 are not set to values
      * that are unsupported by vt-x */
     if (!vtx_check_fixed_values(read_cr0(), read_cr4())) {
         return false;
     }
-    if (vmxon(kpptr_to_paddr(&vmxon_region))) {
+    if (vmxon(kpptr_to_paddr(vmxon_kptr))) {
         printf("vt-x: vmxon failure\n");
         return false;
     }
@@ -1036,7 +1234,15 @@ BOOT_CODE bool_t vtx_init(void)
     clear_bit(msr_bitmap_region.low_msr_write.bitmap, IA32_SYSENTER_CS_MSR);
     clear_bit(msr_bitmap_region.low_msr_write.bitmap, IA32_SYSENTER_ESP_MSR);
     clear_bit(msr_bitmap_region.low_msr_write.bitmap, IA32_SYSENTER_EIP_MSR);
-
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    /* Allow guest access to FS and both GS MSRs */
+    clear_bit(msr_bitmap_region.high_msr_read.bitmap, MSR_BITMAP_MASK(IA32_FS_BASE_MSR));
+    clear_bit(msr_bitmap_region.high_msr_read.bitmap, MSR_BITMAP_MASK(IA32_GS_BASE_MSR));
+    clear_bit(msr_bitmap_region.high_msr_read.bitmap, MSR_BITMAP_MASK(IA32_KERNEL_GS_BASE_MSR));
+    clear_bit(msr_bitmap_region.high_msr_write.bitmap, MSR_BITMAP_MASK(IA32_FS_BASE_MSR));
+    clear_bit(msr_bitmap_region.high_msr_write.bitmap, MSR_BITMAP_MASK(IA32_GS_BASE_MSR));
+    clear_bit(msr_bitmap_region.high_msr_write.bitmap, MSR_BITMAP_MASK(IA32_KERNEL_GS_BASE_MSR));
+#endif
     /* The VMX_EPT_VPID_CAP MSR exists if VMX supports EPT or VPIDs. Whilst
      * VPID support is optional, EPT support is not and is already checked for,
      * so we know that this MSR is safe to read */
@@ -1066,7 +1272,8 @@ static void setMRs_vmexit(uint32_t reason, word_t qualification)
     setMR(NODE_STATE(ksCurThread), buffer, SEL4_VMENTER_CALL_EIP_MR, vmread(VMX_GUEST_RIP));
     setMR(NODE_STATE(ksCurThread), buffer, SEL4_VMENTER_CALL_CONTROL_PPC_MR,
           vmread(VMX_CONTROL_PRIMARY_PROCESSOR_CONTROLS));
-    setMR(NODE_STATE(ksCurThread), buffer, SEL4_VMENTER_CALL_CONTROL_ENTRY_MR, vmread(VMX_CONTROL_ENTRY_INTERRUPTION_INFO));
+    setMR(NODE_STATE(ksCurThread), buffer, SEL4_VMENTER_CALL_INTERRUPT_INFO_MR,
+          vmread(VMX_CONTROL_ENTRY_INTERRUPTION_INFO));
     setMR(NODE_STATE(ksCurThread), buffer, SEL4_VMENTER_FAULT_REASON_MR, reason);
     setMR(NODE_STATE(ksCurThread), buffer, SEL4_VMENTER_FAULT_QUALIFICATION_MR, qualification);
 
@@ -1105,21 +1312,7 @@ static inline void finishVmexitSaving(void)
     /* Update our cache of what is in the vmcs. This is the only value
      * that we cache that can be modified by the guest during execution */
     vcpu->cached_cr0 = vmread(VMX_GUEST_CR0);
-    if (vcpuThreadUsingFPU(NODE_STATE(ksCurThread))) {
-        /* If the vcpu owns the fpu then we did not modify the active cr0 to anything different
-         * to what the VCPU owner requested, so we can update it with any modifications
-         * the guest may have made */
-        vcpu->cr0 = vcpu->cached_cr0;
-    } else {
-        /* If the vcpu does not own the fpu then we will have forced the task switched flag
-         * to be set in the cr0 that was put into the vmcs. Since the VCPU owner (or the guest)
-         * may believe the task switched flag is not set, and the guest may have modified other
-         * parts of cr0 during execution then to update the desired cr0 value to be the cr0
-         * value from the vmcs (thus pulling in any modifications the guest made) but removing
-         * the task switched flag that we set and then adding back in the task switched flag
-         * that may be in the desired current cr0 */
-        vcpu->cr0 = (vcpu->cached_cr0 & ~CR0_TASK_SWITCH) | (NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0 & CR0_TASK_SWITCH);
-    }
+    vcpu->cr0 = vcpu->cached_cr0;
 }
 
 exception_t handleVmexit(void)
@@ -1129,107 +1322,30 @@ exception_t handleVmexit(void)
     word_t qualification;
     uint32_t reason;
     finishVmexitSaving();
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    vcpu_restore_host_msrs();
+#endif
     /* the basic exit reason is the bottom 16 bits of the exit reason field */
     reason = vmread(VMX_DATA_EXIT_REASON) & MASK(16);
     if (reason == EXTERNAL_INTERRUPT) {
+        NODE_LOCK_IRQ;
         if (vmx_feature_ack_on_exit) {
-            interrupt = vmread(VMX_DATA_EXIT_INTERRUPT_INFO);
-            ARCH_NODE_STATE(x86KScurInterrupt) = interrupt & 0xff;
-            NODE_LOCK_IRQ_IF(interrupt != int_remote_call_ipi);
+            interrupt = vmread(VMX_DATA_EXIT_INTERRUPT_INFO) & 0xff;
+            ARCH_NODE_STATE(x86KScurInterrupt) = interrupt;
             handleInterruptEntry();
         } else {
             /* poll for the pending irq. We will then handle it once we return back
              * up to restore_user_context */
             receivePendingIRQ();
         }
+#ifdef ENABLE_SMP_SUPPORT
+        VMCheckBoundNotification(NODE_STATE(ksCurThread));
+#endif
         return EXCEPTION_NONE;
     }
 
     NODE_LOCK_SYS;
 
-    if (!vcpuThreadUsingFPU(NODE_STATE(ksCurThread))) {
-        /* since this vcpu does not currently own the fpu state, check if the kernel should
-         * switch the fpu owner or not. We switch if the guest performed and unimplemented device
-         * exception AND the owner of this vcpu has not requested that these exceptions be forwarded
-         * to them (i.e. if they have not explicitly set the unimplemented device exception in the
-         * exception_bitmap) */
-        if (reason == EXCEPTION_OR_NMI && !(NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->exception_bitmap & BIT(int_unimpl_dev))) {
-            interrupt = vmread(VMX_DATA_EXIT_INTERRUPT_INFO);
-            /* The exception number is the bottom 8 bits of the interrupt info */
-            if ((interrupt & 0xff) == int_unimpl_dev) {
-                switchLocalFpuOwner(&NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->fpuState);
-                return EXCEPTION_NONE;
-            }
-        } else if (reason == CONTROL_REGISTER && !(NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0_mask & CR0_TASK_SWITCH)) {
-            /* we get here if the guest is attempting to write to a control register that is set (by
-             * a 1 bit in the cr0 mask) as being owned by the host. If we got here then the previous check
-             * on cr0_mask meant that the VCPU owner did not claim ownership of the the task switch bit
-             * however we may have temporarily claimed ownership for the purposes of FPU switching.
-             * At this point we could still have a false positive, as the guest could be attempted to
-             * manipulate bits that are not task switch, so we still have to be careful and propogate
-             * all or some of an attempted write */
-            qualification = vmread(VMX_DATA_EXIT_QUALIFICATION);
-            vmx_data_exit_qualification_control_regster_t qual;
-            qual.words[0] = qualification;
-            /* We only care about some of the exit qualification cases, we handle them here
-             * and will deliver any others through to fault handler */
-            switch (vmx_data_exit_qualification_control_regster_get_access_type(qual)) {
-            case VMX_EXIT_QUAL_TYPE_MOV_CR: {
-                /* check for cr0 */
-                if (vmx_data_exit_qualification_control_regster_get_cr(qual) == 0) {
-                    vcpu_gp_register_t source = crExitRegs[vmx_data_exit_qualification_control_regster_get_reg(qual)];
-                    word_t value;
-                    if (source == VCPU_ESP) {
-                        /* ESP is the only register that is is not part of the general purpose
-                         * registers that we have to save and restore ourselves, so we need to
-                         * get this one from the vmcs */
-                        value = vmread(VMX_GUEST_RSP);
-                    } else {
-                        value = NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->gp_registers[source];
-                    }
-                    /* First unset the task switch bit in cr0 */
-                    NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0 &= ~CR0_TASK_SWITCH;
-                    /* now set it to the value we were given */
-                    NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0 |= value & CR0_TASK_SWITCH;
-                    /* check if there are any parts of the write remaining to forward. we only need
-                     * to consider bits that the hardware will not have handled without faulting, which
-                     * is writing any bit such that it is different to the shadow, but only considering
-                     * bits that the VCPU owner has declared that they want to own (via the cr0_shadow)
-                     */
-                    if (!((value ^ NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0_shadow) &
-                          NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0_mask)) {
-                        return EXCEPTION_NONE;
-                    }
-                }
-                break;
-            }
-            case VMX_EXIT_QUAL_TYPE_CLTS: {
-                /* Easy case. Just remove the task switch bit out of cr0 */
-                NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0 &= ~CR0_TASK_SWITCH;
-                return EXCEPTION_NONE;
-            }
-            case VMX_EXIT_QUAL_TYPE_LMSW: {
-                uint16_t value = vmx_data_exit_qualification_control_regster_get_data(qual);
-                /* First unset the task switch bit in cr0 */
-                NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0 &= ~CR0_TASK_SWITCH;
-                /* now set it to the value we were given */
-                NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0 |= value & CR0_TASK_SWITCH;
-                /* check if there are any parts of the write remaining to forward. we only need
-                 * to consider bits that the hardware will not have handled without faulting, which
-                 * is writing any bit such that it is different to the shadow, but only considering
-                 * bits that the VCPU owner has declared that they want to own (via the cr0_shadow).
-                 * Additionally since LMSW only loads the bottom 4 bits of CR0 we only consider
-                 * the low 4 bits
-                 */
-                if (!((value ^ NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0_shadow) &
-                      NODE_STATE(ksCurThread)->tcbArch.tcbVCPU->cr0_mask & MASK(4))) {
-                    return EXCEPTION_NONE;
-                }
-                break;
-            }
-            }
-        }
-    }
     switch (reason) {
     case EXCEPTION_OR_NMI:
     case MOV_DR:
@@ -1275,7 +1391,7 @@ void VMCheckBoundNotification(tcb_t *tcb)
 {
     /* We want to check if the VM we are currently running has received
      * a message on its bound notification object. This check is done
-     * in c_traps when we first peform a SysVMEnter, but we could presently
+     * in c_traps when we first perform a SysVMEnter, but we could presently
      * be running a VM and another core may have placed a message on the
      * endpoint
      */
@@ -1344,58 +1460,6 @@ static void setEPTRoot(cap_t vmxSpace, vcpu_t *vcpu)
     }
 }
 
-static void handleLazyFpu(void)
-{
-    vcpu_t *vcpu = NODE_STATE(ksCurThread)->tcbArch.tcbVCPU;
-    word_t cr0 = vcpu->cr0;
-    word_t exception_bitmap = vcpu->exception_bitmap;
-    word_t cr0_mask = vcpu->cr0_mask;
-    word_t cr0_shadow = vcpu->cr0_shadow;
-    /* if the vcpu actually owns the fpu then we do not need to change any bits
-     * and so we will put into the vmcs precisely what the VCPU owner has requested */
-    if (!vcpuThreadUsingFPU(NODE_STATE(ksCurThread))) {
-        /* when the vcpu doesn't own the fpu we need to force the task switched flag
-         * so that we can take an exception and perform lazy fpu switching */
-        cr0 |= CR0_TASK_SWITCH;
-        /* once we have forced the task switched flag we also need to handle
-         * unimplemented device exceptions so we force these to trap. In the case
-         * where the VCPU owner had already set these to trap then this well be
-         * checked in handleVmexit and the exception will get forwarded */
-        exception_bitmap |= BIT(int_unimpl_dev);
-        /* we need to claim ownership of the task switch bit so that any modifications
-         * of it cause an exception and we must do this regardless of whether the
-         * VCPU owner also wants to claim ownership. In the scenario where the VCPU
-         * owner had also claimed ownership then in handleVmexit we won't actually
-         * do any fpu switching and will forward the fault */
-        cr0_mask |= CR0_TASK_SWITCH;
-        /* since we have forced a value in the cr0 mask we need to set an appropriate value
-         * in the cr0 read shadow. If the VCPU owner is also masking this bit then
-         * we should use the value they have put in the cr0 read shadow. If they aren't
-         * then the read shadow will contain garbage and we should instead set the
-         * read shadow to the actual desired cr0 value */
-        if (!(vcpu->cr0_mask & CR0_TASK_SWITCH)) {
-            cr0_shadow &= ~CR0_TASK_SWITCH;
-            cr0_shadow |= vcpu->cr0 & CR0_TASK_SWITCH;
-        }
-    }
-    if (cr0 != vcpu->cached_cr0) {
-        vmwrite(VMX_GUEST_CR0, cr0);
-        vcpu->cached_cr0 = cr0;
-    }
-    if (exception_bitmap != vcpu->cached_exception_bitmap) {
-        vmwrite(VMX_CONTROL_EXCEPTION_BITMAP, exception_bitmap);
-        vcpu->cached_exception_bitmap = exception_bitmap;
-    }
-    if (cr0_mask != vcpu->cached_cr0_mask) {
-        vmwrite(VMX_CONTROL_CR0_MASK, cr0_mask);
-        vcpu->cached_cr0_mask = cr0_mask;
-    }
-    if (cr0_shadow != vcpu->cached_cr0_shadow) {
-        vmwrite(VMX_CONTROL_CR0_READ_SHADOW, cr0_shadow);
-        vcpu->cached_cr0_shadow = cr0_shadow;
-    }
-}
-
 void clearVPIDIOPortMappings(vpid_t vpid, uint16_t first, uint16_t last)
 {
     if (vpid == VPID_INVALID) {
@@ -1421,13 +1485,23 @@ static inline vpid_t nextVPID(vpid_t vpid)
 static void invalidateVPID(vpid_t vpid)
 {
     vcpu_t *vcpu = x86KSVPIDTable[vpid];
-    /* clear the IO bitmap as when we sever the VPID asignment we lose
+    /* clear the IO bitmap as when we sever the VPID assignment we lose
      * the ability for the references in IO port capabilities to invalidate */
     memset(vcpu->io, ~0, sizeof(vcpu->io));
     /* invalidate the VPID context */
     if (vmx_feature_vpid) {
         invvpid_context(vpid);
     }
+}
+
+/** Disassociate a VPID from its VCPU */
+static void releaseVPID(vpid_t vpid)
+{
+    vcpu_t *vcpu = x86KSVPIDTable[vpid];
+
+    invalidateVPID(vpid);
+    vcpu->vpid = VPID_INVALID;
+    x86KSVPIDTable[vpid] = NULL;
 }
 
 static vpid_t findFreeVPID(void)
@@ -1442,12 +1516,9 @@ static vpid_t findFreeVPID(void)
         vpid = nextVPID(vpid);
     } while (vpid != x86KSNextVPID);
 
-    /* Forcively take the next VPID */
+    /* Forcibly take the next VPID */
     vpid = x86KSNextVPID;
-    invalidateVPID(vpid);
-
-    x86KSVPIDTable[vpid]->vpid = VPID_INVALID;
-    x86KSVPIDTable[vpid] = NULL;
+    releaseVPID(vpid);
 
     x86KSNextVPID = nextVPID(x86KSNextVPID);
     return vpid;
@@ -1461,9 +1532,52 @@ static void storeVPID(vcpu_t *vcpu, vpid_t vpid)
     vcpu->vpid = vpid;
 }
 
+/* Normally the seL4_TCBFlag_fpuDisabled TCB flag is used to decide whether to
+ * enable or disable the FPU. However, with x86 virtualisation there is only
+ * one TCB. Use the task flag for the host and always enable FPU for the guest.
+ *
+ * When either the host or the guest's FPU is loaded, ksCurFPUOwner will
+ * point to our TCB. saveFpuState and loadFpuState check fpu_active and
+ * do the right thing depending on the current FPU user.
+ */
+void vcpu_fpu_to_guest(tcb_t *tcb, vcpu_t *vcpu)
+{
+    if (nativeThreadUsingFPU(tcb)) {
+        /* Make sure FPU is enabled */
+        enableFpu();
+        if (!vcpu->fpu_active) {
+            /* Host was using the FPU, switch to guest FPU state */
+            saveFpuState(tcb);
+            vcpu->fpu_active = true;
+            loadFpuState(tcb);
+        }
+    } else {
+        /* Someone else used the FPU, load guest's FPU state */
+        vcpu->fpu_active = true;
+        switchLocalFpuOwner(tcb);
+    }
+}
+
+void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu)
+{
+    if (tcb->tcbFlags & seL4_TCBFlag_fpuDisabled) {
+        /* FPU may have been enabled for the guest, but host isn't allowed to use it */
+        disableFpu();
+    } else if (nativeThreadUsingFPU(tcb) && vcpu->fpu_active) {
+        /* Guest was using the FPU, switch to host FPU state */
+        saveFpuState(tcb);
+        vcpu->fpu_active = false;
+        loadFpuState(tcb);
+    } else if (!nativeThreadUsingFPU(tcb)) {
+        /* Handle corner cases like dissociated vcpu */
+        switchLocalFpuOwner(tcb);
+    }
+}
+
 void restoreVMCS(void)
 {
-    vcpu_t *expected_vmcs = NODE_STATE(ksCurThread)->tcbArch.tcbVCPU;
+    tcb_t *cur_thread = NODE_STATE(ksCurThread);
+    vcpu_t *expected_vmcs = cur_thread->tcbArch.tcbVCPU;
 
     /* Check that the right VMCS is active and current. */
     if (ARCH_NODE_STATE(x86KSCurrentVCPU) != expected_vmcs) {
@@ -1483,8 +1597,7 @@ void restoreVMCS(void)
             vmwrite(VMX_CONTROL_VPID, vpid);
         }
     }
-    setEPTRoot(TCB_PTR_CTE_PTR(NODE_STATE(ksCurThread), tcbArchEPTRoot)->cap, expected_vmcs);
-    handleLazyFpu();
+    setEPTRoot(TCB_PTR_CTE_PTR(cur_thread, tcbArchEPTRoot)->cap, expected_vmcs);
 }
 
 void invept(ept_pml4e_t *ept_pml4)

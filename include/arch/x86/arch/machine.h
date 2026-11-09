@@ -25,10 +25,11 @@
 #define IA32_GS_BASE_MSR        0xC0000101
 #define IA32_LSTAR_MSR          0xC0000082
 #define IA32_STAR_MSR           0xC0000081
+#define IA32_CSTAR_MSR          0xC0000083
 #define IA32_FMASK_MSR          0xC0000084
 #define IA32_EFER_MSR 0xC0000080
 #define IA32_PLATFORM_INFO_MSR  0xCE
-#define IA32_XSS_MSR            0xD0A
+#define IA32_XSS_MSR            0xDA0
 #define IA32_FEATURE_CONTROL_MSR 0x3A
 #define IA32_KERNEL_GS_BASE_MSR 0xC0000102
 #define IA32_VMX_BASIC_MSR      0x480
@@ -37,6 +38,7 @@
 #define IA32_VMX_PROCBASED_CTLS2_MSR 0x48B
 #define IA32_VMX_EXIT_CTLS_MSR  0x483
 #define IA32_VMX_ENTRY_CTLS_MSR 0x484
+#define IA32_VMX_MISC_MSR 0x485
 #define IA32_VMX_TRUE_PINBASED_CTLS_MSR 0x48D
 #define IA32_VMX_TRUE_PROCBASED_CTLS_MSR 0x48E
 #define IA32_VMX_TRUE_EXIT_CTLS_MSR 0x48F
@@ -55,6 +57,7 @@
  */
 #define SKYLAKE_1_MODEL_ID      0x4E
 #define SKYLAKE_2_MODEL_ID      0x5E
+#define SKYLAKE_X_MODEL_ID      0x55
 #define BROADWELL_1_MODEL_ID    0x4D
 #define BROADWELL_2_MODEL_ID    0x56
 #define BROADWELL_3_MODEL_ID    0x4F
@@ -93,6 +96,23 @@
 #define IA32_SPEC_CTRL_MSR_STIBP            BIT(1) /* Single Thread Indirect Branch Predictors */
 
 #define IA32_PRED_CMD_MSR                   0x49
+
+/*
+ * CPUID bits for detecting the kernel is running as a guest.
+ *
+ * These bits correspond to the strings "KVMKVMKVM" for KVM and "TCGTCGTCGTCG"
+ * for QEMU's Tiny Code Generator (TCG).
+ *
+ * https://docs.kernel.org/virt/kvm/x86/cpuid.html.
+ */
+#define KVM_CPUID_SIGNATURE 0x40000000
+
+#define CPUID_TCG_EBX 0x54474354
+#define CPUID_TCG_ECX 0x43544743
+#define CPUID_TCG_EDX 0x47435447
+#define CPUID_KVM_EBX 0x4b4d564b
+#define CPUID_KVM_ECX 0x564b4d56
+#define CPUID_KVM_EDX 0x4d
 
 word_t PURE getRestartPC(tcb_t *thread);
 void setNextPC(tcb_t *thread, word_t v);
@@ -337,11 +357,10 @@ static inline void x86_load_fsgs_base(tcb_t *thread, cpu_id_t cpu)
     x86_write_gs_base(gs_base, cpu);
 }
 
-/* Cleaning memory before user-level access */
+/* Cleaning memory before user-level access. Does not flush cache. */
 static inline void clearMemory(void *ptr, unsigned int bits)
 {
     memzero(ptr, BIT(bits));
-    /* no cleaning of caches necessary on IA-32 */
 }
 
 /* Initialises MSRs required to setup sysenter and sysexit */
@@ -359,14 +378,9 @@ static inline unsigned long getFaultAddr(void)
     return read_cr2();
 }
 
-static inline void Arch_finaliseInterrupt(void)
-{
-    ARCH_NODE_STATE(x86KScurInterrupt) = int_invalid;
-}
-
 static inline void x86_set_tls_segment_base(word_t tls_base);
 
-/* Update the value of the actual regsiter to hold the expected value */
+/* Update the value of the actual register to hold the expected value */
 static inline exception_t Arch_setTLSRegister(word_t tls_base)
 {
     word_t sanitised = Mode_sanitiseRegister(TLS_BASE, tls_base);
@@ -378,7 +392,7 @@ static inline exception_t Arch_setTLSRegister(word_t tls_base)
 #ifndef CONFIG_FSGSBASE_INST
     /*
      * The context is only updated from the register on a context switch
-     * if the FSGS instructions are enabled. When they aren't it msut be
+     * if the FSGS instructions are enabled. When they aren't it must be
      * manually stored here.
      */
     setRegister(NODE_STATE(ksCurThread), TLS_BASE, tls_base);

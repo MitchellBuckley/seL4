@@ -12,11 +12,11 @@
 
 ENTRY(_start)
 
-KERNEL_OFFSET = KERNEL_ELF_BASE - KERNEL_ELF_PADDR_BASE;
+KERNEL_OFFSET = KERNEL_ELF_BASE_RAW - KERNEL_ELF_PADDR_BASE_RAW;
 
 SECTIONS
 {
-    . = KERNEL_ELF_BASE;
+    . = KERNEL_ELF_BASE_RAW;
 
     .boot . : AT(ADDR(.boot) - KERNEL_OFFSET)
     {
@@ -59,14 +59,17 @@ SECTIONS
         *(.data)
     }
 
-    .bss . : AT(ADDR(.bss) - KERNEL_OFFSET)
+    .bss . (NOLOAD): AT(ADDR(.bss) - KERNEL_OFFSET)
     {
         *(.bss)
+        *(COMMON) /* fallback in case '-fno-common' is not used */
 
-        /* 4k breakpoint stack */
-        _breakpoint_stack_bottom = .;
-        . = . + 4K;
-        _breakpoint_stack_top = .;
+#if defined(CONFIG_ARCH_AARCH32) && !defined(CONFIG_ARM_HYPERVISOR_SUPPORT)
+        /* 4k abort stack, needed for PMODE_ABORT on ARM32 */
+        _abort_stack_bottom = .;
+        . = . + 4K * CONFIG_MAX_NUM_NODES;
+        _abort_stack_top = .;
+#endif
 
         /* large data such as the globals frame and global PD */
         *(.bss.aligned)

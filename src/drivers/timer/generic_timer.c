@@ -12,20 +12,24 @@ BOOT_CODE void initGenericTimer(void)
         /* check the frequency is correct */
         word_t gpt_cntfrq = 0;
         SYSTEM_READ_WORD(CNTFRQ, gpt_cntfrq);
-        /* The CNTFRQ register is 32-bits and is safe to compare with TIMER_CLOCK_HZ. */
-        if (gpt_cntfrq != 0 && gpt_cntfrq != TIMER_CLOCK_HZ) {
-            printf("Warning:  gpt_cntfrq %lu, expected %u\n", gpt_cntfrq,
-                   (uint32_t) TIMER_CLOCK_HZ);
+        /* The CNTFRQ register is a 32-bit register, its value can safely be
+         * compared with TIMER_CLOCK_HZ.
+         */
+        if ((gpt_cntfrq != 0) && (gpt_cntfrq != TIMER_CLOCK_HZ)) {
+            /* TIMER_CLOCK_HZ is defined as a unsigned long long constant on
+             * every architecture. */
+            printf("Warning:  gpt_cntfrq %"SEL4_PRIu_word", expected %llu\n",
+                   gpt_cntfrq, TIMER_CLOCK_HZ);
         }
     }
 
 #ifdef CONFIG_KERNEL_MCS
     /* this sets the irq to UINT64_MAX */
     ackDeadlineIRQ();
-    SYSTEM_WRITE_WORD(CNT_CTL, BIT(0));
 #else /* CONFIG_KERNEL_MCS */
     resetTimer();
 #endif /* !CONFIG_KERNEL_MCS */
+    SYSTEM_WRITE_WORD(CNT_CTL, BIT(0));
 }
 
 /*
@@ -57,29 +61,34 @@ static inline uint64_t read_cntpct(void)
     return val;
 }
 
-static void save_virt_timer(vcpu_t *vcpu)
+static void disable_virt_timer(vcpu_t *vcpu)
 {
-    /* Save control register */
-    vcpu_save_reg(vcpu, seL4_VCPUReg_CNTV_CTL);
-    vcpu_hw_write_reg(seL4_VCPUReg_CNTV_CTL, 0);
-    /* Save Compare Value and Offset registers */
+    if (likely(vcpu)) {
+        /* Save control register */
+        vcpu_save_reg(vcpu, seL4_VCPUReg_CNTV_CTL);
+        /* Save Compare Value and Offset registers */
 #ifdef CONFIG_ARCH_AARCH64
-    vcpu_save_reg(vcpu, seL4_VCPUReg_CNTV_CVAL);
-    vcpu_save_reg(vcpu, seL4_VCPUReg_CNTVOFF);
-    vcpu_save_reg(vcpu, seL4_VCPUReg_CNTKCTL_EL1);
-    check_export_arch_timer();
+        vcpu_save_reg(vcpu, seL4_VCPUReg_CNTV_CVAL);
+        vcpu_save_reg(vcpu, seL4_VCPUReg_CNTVOFF);
+        vcpu_save_reg(vcpu, seL4_VCPUReg_CNTKCTL_EL1);
 #else
-    uint64_t cval = get_cntv_cval_64();
-    uint64_t cntvoff = get_cntv_off_64();
-    vcpu_write_reg(vcpu, seL4_VCPUReg_CNTV_CVALhigh, (word_t)(cval >> 32));
-    vcpu_write_reg(vcpu, seL4_VCPUReg_CNTV_CVALlow, (word_t)cval);
-    vcpu_write_reg(vcpu, seL4_VCPUReg_CNTVOFFhigh, (word_t)(cntvoff >> 32));
-    vcpu_write_reg(vcpu, seL4_VCPUReg_CNTVOFFlow, (word_t)cntvoff);
+        uint64_t cval = get_cntv_cval_64();
+        uint64_t cntvoff = get_cntv_off_64();
+        vcpu_write_reg(vcpu, seL4_VCPUReg_CNTV_CVALhigh, (word_t)(cval >> 32));
+        vcpu_write_reg(vcpu, seL4_VCPUReg_CNTV_CVALlow, (word_t)cval);
+        vcpu_write_reg(vcpu, seL4_VCPUReg_CNTVOFFhigh, (word_t)(cntvoff >> 32));
+        vcpu_write_reg(vcpu, seL4_VCPUReg_CNTVOFFlow, (word_t)cntvoff);
+        vcpu_save_reg(vcpu, seL4_VCPUReg_CNTKCTL);
 #endif
 #ifdef CONFIG_VTIMER_UPDATE_VOFFSET
-    /* Save counter value at the time the vcpu is disabled */
-    vcpu->virtTimer.last_pcount = read_cntpct();
+        /* Save counter value at the time the vcpu is disabled */
+        vcpu->virtTimer.last_pcount = read_cntpct();
 #endif
+    }
+    /* With or without VCPU object, turn off the timer and return to
+     * user-mode timer config */
+    vcpu_hw_write_reg(seL4_VCPUReg_CNTV_CTL, 0);
+    check_export_arch_timer();
 }
 
 static void restore_virt_timer(vcpu_t *vcpu)
@@ -93,6 +102,7 @@ static void restore_virt_timer(vcpu_t *vcpu)
     uint32_t cval_low = vcpu_read_reg(vcpu, seL4_VCPUReg_CNTV_CVALlow);
     uint64_t cval = ((uint64_t)cval_high << 32) | (uint64_t) cval_low;
     set_cntv_cval_64(cval);
+    vcpu_restore_reg(vcpu, seL4_VCPUReg_CNTKCTL);
 #endif
 
     /* Set virtual timer offset */

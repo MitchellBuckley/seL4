@@ -8,9 +8,8 @@
 
 ---- Default base size: uint64_t
 base 64(48,1)
-#define BF_CANONICAL_RANGE 48
 
--- Including the common structures.bf is neccessary because
+-- Including the common structures.bf is necessary because
 -- we need the structures to be visible here when building
 -- the capType
 #include <object/structures_64.bf>
@@ -125,6 +124,7 @@ block io_port_cap {
 #ifdef CONFIG_IOMMU
 
 -- IO Space Cap
+-- See also: seL4_X86_IOSpace_CapData in arch/shared_types.bf
 block io_space_cap {
     padding 64
     field       capType         5
@@ -132,12 +132,6 @@ block io_space_cap {
     field       capPCIDevice    16
 
     padding                     27
-}
-
-block io_space_capdata {
-    padding 32
-    field domainID              16
-    field PCIDevice             16
 }
 
 -- IO Page Table Cap
@@ -279,7 +273,7 @@ block vm_attributes {
 
 ---- x86-64 specific object types
 
--- GDT entries (Segment Desciptors)
+-- GDT entries (Segment Descriptors)
 
 block gdt_null {
     padding                         19
@@ -344,7 +338,7 @@ tagged_union gdt_entry seg_type {
     tag gdt_code    11
 }
 
--- IDT entries (Gate Desciptors)
+-- IDT entries (Gate Descriptors)
 
 block task_gate {
     padding                         32

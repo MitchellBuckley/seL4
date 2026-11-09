@@ -8,15 +8,14 @@
 
 #include <util.h>
 
-/* See idle_thread for an explanation as to why FORCE_INLINE is required here. */
-static inline void FORCE_INLINE wfi(void)
-{
-    asm volatile("wfi" ::: "memory");
-}
-
 static inline void dsb(void)
 {
     asm volatile("dsb" ::: "memory");
+}
+
+static inline void dsb_ishst(void)
+{
+    asm volatile("dsb ishst" ::: "memory");
 }
 
 static inline void dmb(void)

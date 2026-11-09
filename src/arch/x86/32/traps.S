@@ -79,7 +79,7 @@ int_##number:                                \
     SET_SELECTOR(fs, SEL_FS, tmp) \
     SET_SELECTOR(gs, SEL_GS, tmp)
 
-.section .text
+.section .text, "ax"
 
 INT_HANDLER_WITHOUT_ERR_CODE(00)
 INT_HANDLER_WITHOUT_ERR_CODE(01)
@@ -362,6 +362,10 @@ handle_interrupt:
     jz kernel_interrupt
 
 user_interrupt:
+    # The CPU does not clear DF on interrupt/exception entry. Kernel code
+    # needs DF to be off. User are RFLAGS already saved by CPU at this point.
+    cld
+
     # switch to kernel stack
     SET_KERNEL_STACK
 
@@ -542,6 +546,12 @@ BEGIN_FUNC(handle_syscall)
 
     # switch to kernel stack
     SET_KERNEL_STACK
+
+    # After SYSENTER the user flags NT and DF (and AC) are still present.
+    # DF and NT can affect kernel integrity, so must be clear. The are already
+    # saved above for user return.
+    pushl   $0x2
+    popfl
 
     # Push all the arguments for c_handle_syscall
 #ifdef CONFIG_KERNEL_MCS

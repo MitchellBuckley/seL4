@@ -9,7 +9,7 @@
 ---- Default base size: uint32_t
 base 32
 
--- Including the common structures_32.bf is neccessary because
+-- Including the common structures_32.bf is necessary because
 -- we need the structures to be visible here when building
 -- the capType
 #include <object/structures_32.bf>
@@ -98,17 +98,13 @@ block io_port_cap {
 #ifdef CONFIG_IOMMU
 
 -- IO Space Cap
+-- See also: seL4_X86_IOSpace_CapData in arch/shared_types.bf
 block io_space_cap {
     field       capDomainID     16
     field       capPCIDevice    16
 
     padding                     28
     field       capType         4
-}
-
-block io_space_capdata {
-    field domainID              16
-    field PCIDevice             16
 }
 
 -- IO Page Table Cap
@@ -258,7 +254,7 @@ block vm_attributes {
 
 ---- IA32 specific object types
 
--- GDT entries (Segment Desciptors)
+-- GDT entries (Segment Descriptors)
 
 block gdt_null {
     padding                         19
@@ -323,7 +319,7 @@ tagged_union gdt_entry desc_type {
     tag gdt_code    6
 }
 
--- IDT entries (Gate Desciptors)
+-- IDT entries (Gate Descriptors)
 
 block task_gate {
     padding                         16

@@ -4,8 +4,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 
-cmake_minimum_required(VERSION 3.7.2)
-
 declare_platform(omap3 KernelPlatformOMAP3 PLAT_OMAP3 KernelSel4ArchAarch32)
 
 if(KernelPlatformOMAP3)
@@ -18,7 +16,7 @@ if(KernelPlatformOMAP3)
     list(APPEND KernelDTSList "tools/dts/omap3.dts")
     list(APPEND KernelDTSList "src/plat/omap3/overlay-omap3.dts")
     declare_default_headers(
-        TIMER_FREQUENCY 13000000llu
+        TIMER_FREQUENCY 13000000
         MAX_IRQ 95
         INTERRUPT_CONTROLLER drivers/irq/omap3.h
         TIMER drivers/timer/omap3430.h

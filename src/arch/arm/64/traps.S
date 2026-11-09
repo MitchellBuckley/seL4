@@ -10,9 +10,6 @@
 #include <arch/machine/hardware.h>
 #include <arch/machine/registerset.h>
 
-#define VM_EVENT_DATA_ABORT 0
-#define VM_EVENT_PREFETCH_ABORT 1
-
 #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
 
 #define ELR     elr_el2
@@ -32,7 +29,7 @@
 
 .macro lsp_i _tmp
     mrs     \_tmp, TPIDR
-#if CONFIG_MAX_NUM_NODES > 1
+#ifdef CONFIG_ENABLE_SMP_SUPPORT
     bic     \_tmp, \_tmp, #0xfff
 #endif
     mov     sp, \_tmp
@@ -43,31 +40,61 @@
     b       \label
 .endm
 
-.section .vectors
+#ifdef CONFIG_DEBUG_BUILD
+.macro ventry_invalid
+.align 7
+    /* compute vect_offset argument */
+    adr     x0, .
+    adr     x19, arm_vector_table
+    sub     x0, x0, x19
+    b       invalid_vector_entry
+.endm
+#else
+.macro ventry_invalid
+    ventry invalid_vector_entry
+.endm
+#endif
 
+#ifdef CONFIG_AARCH64_SERROR_IGNORE
+.macro ventry_serror
+.align 7
+    eret
+.endm
+#else
+.macro ventry_serror
+    ventry_invalid
+.endm
+#endif
+
+.section .vectors, "ax"
+
+/* The layout of this table are specified in Table D1-7, 'Vector offsets from
+ * vector table base address' of ARM DDI 0487B.b ID092517.
+ * Each vector entry has 128-byte alignment, and so supports 32 instructions.
+ */
 BEGIN_FUNC(arm_vector_table)
-    ventry  invalid_vector_entry           // Synchronous EL1t/EL2t
-    ventry  invalid_vector_entry           // IRQ EL1t/EL2t
-    ventry  invalid_vector_entry           // FIQ EL1t/EL2t
-    ventry  invalid_vector_entry           // SError EL1t/EL2t
+    ventry_invalid                         // Synchronous EL1t/EL2t
+    ventry_invalid                         // IRQ EL1t/EL2t
+    ventry_invalid                         // FIQ EL1t/EL2t
+    ventry_invalid                         // SError EL1t/EL2t
 
     ventry  cur_el_sync                    // Current EL Synchronous (EL1/2)
     ventry  cur_el_irq                     // IRQ
-    ventry  invalid_vector_entry           // FIQ
-    ventry  cur_el_serr                    // SError
+    ventry_invalid                         // FIQ
+    ventry_serror                          // SError
 
     ventry  lower_el_sync                  // Synchronous 64-bit EL0/EL1
     ventry  lower_el_irq                   // IRQ 64-bit EL0/EL1
-    ventry  invalid_vector_entry           // FIQ 64-bit EL0/EL1
-    ventry  lower_el_serr                  // SError 64-bit EL0/EL1
+    ventry_invalid                         // FIQ 64-bit EL0/EL1
+    ventry_serror                          // SError 64-bit EL0/EL1
 
-    ventry  invalid_vector_entry           // Synchronous 32-bit EL0/EL1
-    ventry  invalid_vector_entry           // IRQ 32-bit EL0/EL1
-    ventry  invalid_vector_entry           // FIQ 32-bit EL0/EL1
-    ventry  invalid_vector_entry           // SError 32-bit EL0/EL1
+    ventry_invalid                         // Synchronous 32-bit EL0/EL1
+    ventry_invalid                         // IRQ 32-bit EL0/EL1
+    ventry_invalid                         // FIQ 32-bit EL0/EL1
+    ventry_invalid                         // SError 32-bit EL0/EL1
 END_FUNC(arm_vector_table)
 
-.section .vectors.text
+.section .vectors.text, "ax"
 
 .macro kernel_enter
     /* Storing thread's stack frame */
@@ -93,10 +120,22 @@ END_FUNC(arm_vector_table)
     mrs     x23, SPSR
     stp     x30, x21, [sp, #PT_LR]
     stp     x22, x23, [sp, #PT_ELR_EL1]
+
+    /* Save TLS before acquiring the kernel lock. A remote stall can
+     * switch to idle and leave lock acquisition without reaching the
+     * C entry hook. In particular, EL0 can write TPIDR_EL0 directly. */
+    mrs     x21, tpidr_el0
+    mrs     x22, tpidrro_el0
+    stp     x21, x22, [sp, #PT_TPIDR_EL0]
 .endm
 
+/* Takes argument x0: vect_offset (in debug builds) */
 BEGIN_FUNC(invalid_vector_entry)
     lsp_i   x19
+#ifdef CONFIG_DEBUG_BUILD
+    mrs     x1, ELR
+    bl      c_handle_invalid_vector_entry
+#endif
     b       halt
 END_FUNC(invalid_vector_entry)
 
@@ -126,6 +165,8 @@ cur_el_ia:
     b       halt
 
 cur_el_inv:
+    /* 0x200 corresponding to the offset in the vector table */
+    mov     x0, #0x200
     b       invalid_vector_entry
 END_FUNC(cur_el_sync)
 
@@ -139,14 +180,6 @@ BEGIN_FUNC(cur_el_irq)
     lsp_i   x19
     b       c_handle_interrupt
 END_FUNC(cur_el_irq)
-
-BEGIN_FUNC(cur_el_serr)
-#ifdef CONFIG_PLAT_TX2
-    eret
-#else
-    b       invalid_vector_entry
-#endif
-END_FUNC(cur_el_serr)
 
 BEGIN_FUNC(lower_el_sync)
     kernel_enter
@@ -171,8 +204,6 @@ BEGIN_FUNC(lower_el_sync)
     mov     x0, x25
     b       c_handle_vcpu_fault
 #else
-    cmp     x24, #ESR_EL1_EC_ENFP
-    b.eq    el0_enfp
     b       el0_user
 #endif
 
@@ -200,6 +231,10 @@ lel_syscall:
 #ifdef CONFIG_FASTPATH
     cmp     x7, #SYSCALL_CALL
     b.eq    c_handle_fastpath_call
+#ifdef CONFIG_SIGNAL_FASTPATH
+    cmp     x7, #SYSCALL_SEND
+    b.eq    c_handle_fastpath_signal
+#endif /* CONFIG_SIGNAL_FASTPATH */
     cmp     x7, #SYSCALL_REPLY_RECV
 #ifdef CONFIG_KERNEL_MCS
     mov     x2, x6
@@ -209,12 +244,6 @@ lel_syscall:
 
     mov     x2, x7
     b       c_handle_syscall
-
-el0_enfp:
-#ifdef CONFIG_HAVE_FPU
-    lsp_i   x19
-    b       c_handle_enfp
-#endif /* CONFIG_HAVE_FPU */
 
 el0_user:
     mrs     x20, ELR
@@ -232,11 +261,3 @@ BEGIN_FUNC(lower_el_irq)
     lsp_i   x19
     b       c_handle_interrupt
 END_FUNC(lower_el_irq)
-
-BEGIN_FUNC(lower_el_serr)
-#ifdef CONFIG_PLAT_TX2
-    eret
-#else
-    b       invalid_vector_entry
-#endif
-END_FUNC(lower_el_serr)

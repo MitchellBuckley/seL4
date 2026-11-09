@@ -44,6 +44,57 @@ static inline unsigned int setMR(tcb_t *receiver, word_t *receiveIPCBuffer,
 void tcbSchedEnqueue(tcb_t *tcb);
 void tcbSchedAppend(tcb_t *tcb);
 void tcbSchedDequeue(tcb_t *tcb);
+tcb_queue_t tcb_queue_remove(tcb_queue_t queue, tcb_t *tcb);
+
+static inline bool_t PURE tcb_queue_empty(tcb_queue_t queue)
+{
+    return queue.head == NULL;
+}
+
+static inline tcb_queue_t tcb_queue_prepend(tcb_queue_t queue, tcb_t *tcb)
+{
+    if (tcb_queue_empty(queue)) {
+        queue.end = tcb;
+    } else {
+        tcb->tcbSchedNext = queue.head;
+        queue.head->tcbSchedPrev = tcb;
+    }
+
+    queue.head = tcb;
+
+    return queue;
+}
+
+static inline tcb_queue_t tcb_queue_append(tcb_queue_t queue, tcb_t *tcb)
+{
+    if (tcb_queue_empty(queue)) {
+        queue.head = tcb;
+    } else {
+        tcb->tcbSchedPrev = queue.end;
+        queue.end->tcbSchedNext = tcb;
+    }
+
+    queue.end = tcb;
+
+    return queue;
+}
+
+/* Insert a TCB into a queue immediately before another item in the queue
+   (the queue must initially contain at least two items) */
+static inline void tcb_queue_insert(tcb_t *tcb, tcb_t *after)
+{
+    tcb_t *before;
+    before = after->tcbSchedPrev;
+
+    assert(before != NULL);
+    assert(before != after);
+
+    tcb->tcbSchedPrev = before;
+    tcb->tcbSchedNext = after;
+
+    after->tcbSchedPrev = tcb;
+    before->tcbSchedNext = tcb;
+}
 
 #ifdef CONFIG_DEBUG_BUILD
 void tcbDebugAppend(tcb_t *tcb);
@@ -52,7 +103,6 @@ void tcbDebugRemove(tcb_t *tcb);
 #ifdef CONFIG_KERNEL_MCS
 void tcbReleaseRemove(tcb_t *tcb);
 void tcbReleaseEnqueue(tcb_t *tcb);
-tcb_t *tcbReleaseDequeue(void);
 #endif
 
 #ifdef ENABLE_SMP_SUPPORT
@@ -78,42 +128,64 @@ void remoteTCBStall(tcb_t *tcb);
 #define SCHED_APPEND_CURRENT_TCB    tcbSchedAppend(NODE_STATE(ksCurThread))
 
 #ifdef CONFIG_KERNEL_MCS
-/* Add TCB into the priority ordered endpoint queue */
-static inline tcb_queue_t tcbEPAppend(tcb_t *tcb, tcb_queue_t queue)
+
+static inline bool_t PURE higher_than_tcb_prio(tcb_t *tcb, prio_t priority)
 {
-    /* start at the back of the queue as FIFO is the common case */
-    tcb_t *before = queue.end;
-    tcb_t *after = NULL;
-
-    /* find a place to put the tcb */
-    while (unlikely(before != NULL && tcb->tcbPriority > before->tcbPriority)) {
-        after = before;
-        before = after->tcbEPPrev;
-    }
-
-    if (unlikely(before == NULL)) {
-        /* insert at head */
-        queue.head = tcb;
-    } else {
-        before->tcbEPNext = tcb;
-    }
-
-    if (likely(after == NULL)) {
-        /* insert at tail */
-        queue.end = tcb;
-    } else {
-        after->tcbEPPrev = tcb;
-    }
-
-    tcb->tcbEPNext = after;
-    tcb->tcbEPPrev = before;
-
-    return queue;
+    return tcb != NULL && priority > tcb->tcbPriority;
 }
 
-tcb_queue_t tcbEPDequeue(tcb_t *tcb, tcb_queue_t queue);
+/* Find the rightmost TCB in the given queue that has a priority which is
+   strictly greater than the given priority */
+static tcb_t *find_tcb_with_higher_prio(tcb_queue_t queue, prio_t priority)
+{
+    tcb_t *tcb = queue.end;
 
+    while (higher_than_tcb_prio(tcb, priority)) {
+        tcb = tcb->tcbSchedPrev;
+    }
+
+    return tcb;
+}
+
+/* Insert a TCB into a queue immediately after another item in the queue
+   (the queue must initially contain at least two items) */
+static inline void tcb_queue_insert_after(tcb_t *tcb, tcb_t *before)
+{
+    tcb_t *after;
+    after = before->tcbSchedNext;
+
+    tcb->tcbSchedPrev = before;
+    tcb->tcbSchedNext = after;
+
+    after->tcbSchedPrev = tcb;
+    before->tcbSchedNext = tcb;
+}
+
+/* Add TCB into the priority ordered endpoint or notification queue */
+static inline tcb_queue_t tcbAppend(tcb_t *tcb, tcb_queue_t queue)
+{
+    prio_t priority = tcb->tcbPriority;
+    tcb_queue_t new_queue = queue;
+
+    if (tcb_queue_empty(queue) || priority > queue.head->tcbPriority) {
+        new_queue = tcb_queue_prepend(queue, tcb);
+    } else {
+        if (queue.end->tcbPriority >= priority) {
+            new_queue = tcb_queue_append(queue, tcb);
+        } else {
+            tcb_t *before;
+            before = find_tcb_with_higher_prio(queue, priority);
+            tcb_queue_insert_after(tcb, before);
+        }
+    }
+
+    return new_queue;
+}
+
+/* Check for NullCap or EndpointCap with sufficient access rights */
+bool_t validFaultHandler(cap_t cap);
 #else
+
 tcb_queue_t tcbEPAppend(tcb_t *tcb, tcb_queue_t queue);
 tcb_queue_t tcbEPDequeue(tcb_t *tcb, tcb_queue_t queue);
 
@@ -124,32 +196,28 @@ void deleteCallerCap(tcb_t *receiver);
 word_t copyMRs(tcb_t *sender, word_t *sendBuf, tcb_t *receiver,
                word_t *recvBuf, word_t n);
 exception_t decodeTCBInvocation(word_t invLabel, word_t length, cap_t cap,
-                                cte_t *slot, extra_caps_t excaps, bool_t call,
-                                word_t *buffer);
-exception_t decodeCopyRegisters(cap_t cap, word_t length,
-                                extra_caps_t excaps, word_t *buffer);
+                                cte_t *slot, bool_t call, word_t *buffer);
+exception_t decodeCopyRegisters(cap_t cap, word_t length, word_t *buffer);
 exception_t decodeReadRegisters(cap_t cap, word_t length, bool_t call,
                                 word_t *buffer);
 exception_t decodeWriteRegisters(cap_t cap, word_t length, word_t *buffer);
 exception_t decodeTCBConfigure(cap_t cap, word_t length,
-                               cte_t *slot, extra_caps_t rootCaps, word_t *buffer);
-exception_t decodeSetPriority(cap_t cap, word_t length, extra_caps_t excaps, word_t *buffer);
-exception_t decodeSetMCPriority(cap_t cap, word_t length, extra_caps_t excaps, word_t *buffer);
+                               cte_t *slot, word_t *buffer);
+exception_t decodeSetPriority(cap_t cap, word_t length, word_t *buffer);
+exception_t decodeSetMCPriority(cap_t cap, word_t length, word_t *buffer);
 #ifdef CONFIG_KERNEL_MCS
-exception_t decodeSetSchedParams(cap_t cap, word_t length, cte_t *slot, extra_caps_t excaps, word_t *buffer);
+exception_t decodeSetSchedParams(cap_t cap, word_t length, cte_t *slot, word_t *buffer);
 #else
-exception_t decodeSetSchedParams(cap_t cap, word_t length, extra_caps_t excaps, word_t *buffer);
+exception_t decodeSetSchedParams(cap_t cap, word_t length, word_t *buffer);
 #endif
 exception_t decodeSetIPCBuffer(cap_t cap, word_t length,
-                               cte_t *slot, extra_caps_t excaps, word_t *buffer);
+                               cte_t *slot, word_t *buffer);
 exception_t decodeSetSpace(cap_t cap, word_t length,
-                           cte_t *slot, extra_caps_t excaps, word_t *buffer);
-exception_t decodeDomainInvocation(word_t invLabel, word_t length,
-                                   extra_caps_t excaps, word_t *buffer);
-exception_t decodeBindNotification(cap_t cap, extra_caps_t excaps);
+                           cte_t *slot, word_t *buffer);
+exception_t decodeBindNotification(cap_t cap);
 exception_t decodeUnbindNotification(cap_t cap);
 #ifdef CONFIG_KERNEL_MCS
-exception_t decodeSetTimeoutEndpoint(cap_t cap, cte_t *slot, extra_caps_t excaps);
+exception_t decodeSetTimeoutEndpoint(cap_t cap, cte_t *slot);
 #endif
 
 
@@ -173,11 +241,6 @@ enum thread_control_flag {
     thread_control_update_ipc_buffer = 0x2,
     thread_control_update_space = 0x4,
     thread_control_update_mcp = 0x8,
-#ifdef CONFIG_KERNEL_MCS
-    thread_control_update_sc = 0x10,
-    thread_control_update_fault = 0x20,
-    thread_control_update_timeout = 0x40,
-#endif
 };
 #endif
 
@@ -225,10 +288,6 @@ word_t setMRs_syscall_error(tcb_t *thread, word_t *receiveIPCBuffer);
 word_t CONST Arch_decodeTransfer(word_t flags);
 exception_t CONST Arch_performTransfer(word_t arch, tcb_t *tcb_src,
                                        tcb_t *tcb_dest);
-
-#ifdef ENABLE_SMP_SUPPORT
-void Arch_migrateTCB(tcb_t *thread);
-#endif /* ENABLE_SMP_SUPPORT */
 
 #ifdef CONFIG_DEBUG_BUILD
 void setThreadName(tcb_t *thread, const char *name);

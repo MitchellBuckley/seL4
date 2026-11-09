@@ -6,12 +6,10 @@
 
 #pragma once
 
-#ifdef HAVE_AUTOCONF
-#include <autoconf.h>
-#endif
+#include <sel4/config.h>
+#include <sel4/macros.h>
 
 #ifndef __ASSEMBLER__
-#define LIBSEL4_BIT(n) (1ul<<(n))
 
 #ifdef CONFIG_HARDWARE_DEBUG_API
 /* API arg values for breakpoint API, "type" arguments. */
@@ -53,12 +51,10 @@ enum priorityConstants {
 
 enum seL4_MsgLimits {
     seL4_MsgLengthBits = 7,
-    seL4_MsgExtraCapBits = 2
+    seL4_MsgExtraCapBits = 2,
+    seL4_MsgMaxLength = 120
 };
 
-enum {
-    seL4_MsgMaxLength = 120,
-};
 #define seL4_MsgMaxExtraCaps (LIBSEL4_BIT(seL4_MsgExtraCapBits)-1)
 
 /* seL4_CapRights_t defined in shared_types_*.bf */
@@ -72,16 +68,35 @@ typedef enum {
     seL4_GuardMismatch,
     SEL4_FORCE_LONG_ENUM(seL4_LookupFailureType),
 } seL4_LookupFailureType;
+
+/* Flags to be used with seL4_TCB_Set_Flags */
+typedef enum {
+    seL4_TCBFlag_NoFlag = 0x0,
+    seL4_TCBFlag_fpuDisabled = 0x1,
+
+    SEL4_FORCE_LONG_ENUM(seL4_TCBFlag),
+    seL4_TCBFlag_MASK = seL4_TCBFlag_NoFlag
+#ifdef CONFIG_HAVE_FPU
+                        | seL4_TCBFlag_fpuDisabled
+#endif
+} seL4_TCBFlag;
+
 #endif /* !__ASSEMBLER__ */
 
 #ifdef CONFIG_KERNEL_MCS
 /* Minimum size of a scheduling context (2^{n} bytes) */
-#define seL4_MinSchedContextBits 8
+#define seL4_MinSchedContextBits 7
 #ifndef __ASSEMBLER__
-/* the size of a scheduling context, excluding extra refills */
+/* The size of a scheduling context, including the minimum 2 refills, excluding
+   any extra refills (= 10 words, 2 tick_t, 2 refills (= 2 tick_t each)) */
 #define seL4_CoreSchedContextBytes (10 * sizeof(seL4_Word) + (6 * 8))
 /* the size of a single extra refill */
 #define seL4_RefillSizeBytes (2 * 8)
+SEL4_COMPILE_ASSERT(MinSchedContextBits_min_1, seL4_MinSchedContextBits > 1)
+SEL4_COMPILE_ASSERT(MinSchedContextBits_sufficient,
+                    seL4_CoreSchedContextBytes <= LIBSEL4_BIT(seL4_MinSchedContextBits))
+SEL4_COMPILE_ASSERT(MinSchedContextBits_necessary,
+                    seL4_CoreSchedContextBytes > LIBSEL4_BIT(seL4_MinSchedContextBits - 1))
 
 /*
  * @brief Calculate the max extra refills a scheduling context can contain for a specific size.
@@ -94,6 +109,14 @@ static inline seL4_Word seL4_MaxExtraRefills(seL4_Word size)
 {
     return (LIBSEL4_BIT(size) -  seL4_CoreSchedContextBytes) / seL4_RefillSizeBytes;
 }
+
+/* Flags to be used with seL4_SchedControl_ConfigureFlags */
+typedef enum {
+    seL4_SchedContext_NoFlag = 0x0,
+    seL4_SchedContext_Sporadic = 0x1,
+    SEL4_FORCE_LONG_ENUM(seL4_SchedContextFlag),
+} seL4_SchedContextFlag;
+
 #endif /* !__ASSEMBLER__ */
 #endif /* CONFIG_KERNEL_MCS */
 

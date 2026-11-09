@@ -4,8 +4,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 
-cmake_minimum_required(VERSION 3.7.2)
-
 declare_platform(rockpro64 KernelPlatformRockpro64 PLAT_ROCKPRO64 KernelSel4ArchAarch64)
 
 if(KernelPlatformRockpro64)
@@ -13,12 +11,12 @@ if(KernelPlatformRockpro64)
     declare_seL4_arch(aarch64)
     set(KernelArmCortexA53 ON)
     set(KernelArchArmV8a ON)
+    set(KernelArmGicV3 ON)
     config_set(KernelARMPlatform ARM_PLAT "rockpro64")
-    set(KernelArmPASizeBits40 ON)
     list(APPEND KernelDTSList "tools/dts/rockpro64.dts")
     list(APPEND KernelDTSList "src/plat/rockpro64/overlay-rockpro64.dts")
     declare_default_headers(
-        TIMER_FREQUENCY 24000000llu
+        TIMER_FREQUENCY 24000000
         MAX_IRQ 181
         NUM_PPI 32
         KERNEL_WCET 10u

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Copyright 2020, Data61, CSIRO (ABN 41 687 119 230)
 #
@@ -6,7 +6,7 @@
 #
 
 #
-# Concatinate files together, adding in appropriate "#line" directives.
+# Concatenate files together, adding in appropriate "#line" directives.
 #
 
 while [ $# -ge 1 ]; do

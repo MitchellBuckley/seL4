@@ -5,8 +5,6 @@
  */
 
 #pragma once
-#ifdef HAVE_AUTOCONF
-#include <autoconf.h>
-#endif
 
-
+#include <sel4/config.h>
+#include <sel4/arch/constants_cortex_a57.h>

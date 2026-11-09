@@ -36,8 +36,6 @@ extern char boot_stack_bottom[1];
 extern char boot_stack_top[1];
 
 /* locations in kernel image */
-extern char ki_boot_end[1];
-extern char ki_end[1];
 extern char ki_skim_start[1];
 extern char ki_skim_end[1];
 
@@ -77,13 +75,13 @@ BOOT_CODE static paddr_t find_load_paddr(paddr_t min_paddr, word_t image_size)
     return 0;
 }
 
-BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, paddr_t load_paddr)
+BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, word_t boot_module_end, paddr_t load_paddr)
 {
     v_region_t v_reg;
     word_t entry;
     Elf_Header_t *elf_file = (Elf_Header_t *)boot_module_start;
 
-    if (!elf_checkFile(elf_file)) {
+    if (!elf_checkFile(elf_file, boot_module_end - boot_module_start)) {
         printf("Boot module does not contain a valid ELF image\n");
         return 0;
     }
@@ -145,8 +143,6 @@ BOOT_CODE static paddr_t load_boot_module(word_t boot_module_start, paddr_t load
 
 static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
 {
-    p_region_t boot_mem_reuse_p_reg;
-
     if (!map_kernel_window(
             boot_state.num_ioapic,
             boot_state.ioapic_paddr,
@@ -166,10 +162,6 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
     }
 #endif
 
-    /* reuse boot code/data memory */
-    boot_mem_reuse_p_reg.start = KERNEL_ELF_PADDR_BASE;
-    boot_mem_reuse_p_reg.end = kpptr_to_paddr(ki_boot_end);
-
     /* initialise the CPU */
     if (!init_cpu(config_set(CONFIG_IRQ_IOAPIC) ? 1 : 0)) {
         return false;
@@ -180,8 +172,7 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
             cpu_id,
             &boot_state.mem_p_regs,
             boot_state.ui_info,
-            boot_mem_reuse_p_reg,
-            /* parameters below not modeled in abstract specification */
+            /* parameters below not modelled in abstract specification */
             boot_state.num_drhu,
             boot_state.drhu_list,
             &boot_state.rmrr_list,
@@ -198,7 +189,12 @@ static BOOT_CODE bool_t try_boot_sys_node(cpu_id_t cpu_id)
 
 static BOOT_CODE bool_t add_mem_p_regs(p_region_t reg)
 {
-    if (reg.end > PADDR_TOP && reg.start > PADDR_TOP) {
+    if (reg.start == reg.end) {
+        // Return true here if asked to add an empty region.
+        // Some of the callers round down the end address to
+        return true;
+    }
+    if (reg.end > PADDR_TOP && reg.start >= PADDR_TOP) {
         /* Return true here as it's not an error for there to exist memory outside the kernel window,
          * we're just going to ignore it and leave it to be given out as device memory */
         return true;
@@ -208,14 +204,14 @@ static BOOT_CODE bool_t add_mem_p_regs(p_region_t reg)
         return false;
     }
     if (reg.end > PADDR_TOP) {
-        assert(reg.start <= PADDR_TOP);
+        assert(reg.start < PADDR_TOP);
         /* Clamp a region to the top of the kernel window if it extends beyond */
         reg.end = PADDR_TOP;
     }
     printf("Adding physical memory region 0x%lx-0x%lx\n", reg.start, reg.end);
     boot_state.mem_p_regs.list[boot_state.mem_p_regs.count] = reg;
     boot_state.mem_p_regs.count++;
-    return reserve_region(reg);
+    return true;
 }
 
 /*
@@ -235,10 +231,11 @@ static BOOT_CODE bool_t parse_mem_map(uint32_t mmap_length, uint32_t mmap_addr)
             printf("\tPhysical memory region not addressable\n");
         } else {
             printf("\tPhysical Memory Region from %lx size %lx type %d\n", (long)mem_start, (long)mem_length, type);
-            if (type == MULTIBOOT_MMAP_USEABLE_TYPE && mem_start >= HIGHMEM_PADDR) {
+            if (type == MULTIBOOT_MMAP_USEABLE_TYPE && mem_start >= HIGHMEM_PADDR && mem_length >= BIT(PAGE_BITS)) {
+
                 if (!add_mem_p_regs((p_region_t) {
-                mem_start, mem_start + mem_length
-            })) {
+                ROUND_UP(mem_start, PAGE_BITS), ROUND_DOWN(mem_start + mem_length, PAGE_BITS),
+                })) {
                     return false;
                 }
             }
@@ -272,6 +269,7 @@ static BOOT_CODE bool_t is_compiled_for_microarchitecture(void)
     switch (model_info->model) {
     case SKYLAKE_1_MODEL_ID:
     case SKYLAKE_2_MODEL_ID:
+    case SKYLAKE_X_MODEL_ID:
         if (microarch_generation > 7) {
             return false;
         }
@@ -342,8 +340,7 @@ static BOOT_CODE bool_t try_boot_sys(void)
     p_region_t ui_p_regs;
     paddr_t load_paddr;
 
-    boot_state.ki_p_reg.start = KERNEL_ELF_PADDR_BASE;
-    boot_state.ki_p_reg.end = kpptr_to_paddr(ki_end);
+    boot_state.ki_p_reg = get_p_reg_kernel_img();
 
     if (!x86_cpuid_initialize()) {
         printf("Warning: Your x86 CPU has an unsupported vendor, '%s'.\n"
@@ -414,7 +411,7 @@ static BOOT_CODE bool_t try_boot_sys(void)
         return false;
     }
 
-    /* check if kernel configuration matches platform requirments */
+    /* check if kernel configuration matches platform requirements */
     if (!acpi_fadt_scan(&boot_state.acpi_rsdp)) {
         return false;
     }
@@ -457,7 +454,7 @@ static BOOT_CODE bool_t try_boot_sys(void)
     printf("ELF-loading userland images from boot modules:\n");
     load_paddr = mods_end_paddr;
 
-    load_paddr = load_boot_module(boot_state.boot_module_start, load_paddr);
+    load_paddr = load_boot_module(boot_state.boot_module_start, boot_state.boot_module_end, load_paddr);
     if (!load_paddr) {
         return false;
     }
@@ -565,11 +562,11 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
         }
         uint32_t multiboot_mmap_length = mbi->part2.mmap_length;
         if (multiboot_mmap_length > (SEL4_MULTIBOOT_MAX_MMAP_ENTRIES * sizeof(seL4_X86_mb_mmap_t))) {
-            multiboot_mmap_length = SEL4_MULTIBOOT_MAX_MMAP_ENTRIES * sizeof(seL4_X86_mb_mmap_t);
             printf("Warning: Multiboot has reported more memory map entries, %zd, "
                    "than the max amount that will be passed in the bootinfo, %d. "
                    "These extra regions will still be turned into untyped caps.",
                    multiboot_mmap_length / sizeof(seL4_X86_mb_mmap_t), SEL4_MULTIBOOT_MAX_MMAP_ENTRIES);
+            multiboot_mmap_length = SEL4_MULTIBOOT_MAX_MMAP_ENTRIES * sizeof(seL4_X86_mb_mmap_t);
         }
         memcpy(&boot_state.mb_mmap_info.mmap, (void *)(word_t)mbi->part2.mmap_addr, multiboot_mmap_length);
         boot_state.mb_mmap_info.mmap_length = multiboot_mmap_length;
@@ -599,6 +596,7 @@ static BOOT_CODE bool_t try_boot_sys_mbi1(
 
     boot_state.mem_lower = mbi->part1.mem_lower;
     boot_state.boot_module_start = modules->start;
+    boot_state.boot_module_end = modules->end;
 
     /* Initialize ACPI */
     if (!acpi_init(&boot_state.acpi_rsdp)) {
@@ -652,6 +650,7 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
 
             if (mod_count == 0) {
                 boot_state.boot_module_start = module->start;
+                boot_state.boot_module_end = module->end;
             }
 
             mod_count ++;
@@ -674,6 +673,7 @@ static BOOT_CODE bool_t try_boot_sys_mbi2(
                 printf("\tPhysical Memory Region from %llx size %llx type %u\n", m->addr, m->size, m->type);
                 if (m->addr != (uint64_t)(word_t)m->addr) {
                     printf("\t\tPhysical memory region not addressable\n");
+                    continue;
                 }
 
                 if (m->type == MULTIBOOT_MMAP_USEABLE_TYPE && m->addr >= HIGHMEM_PADDR) {

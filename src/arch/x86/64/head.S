@@ -28,13 +28,18 @@
 #define IA32_APIC_BASE_MSR 0x01B
 #define APIC_ID_OFFSET 0x020
 
-.section .phys.text
+.section .phys.text, "ax", @progbits
 
 .code32
 
 BEGIN_FUNC(print_string)
-    movw $0x3f8, %dx
 1:
+    movw $0x3f8+5, %dx
+2:
+    inb  (%dx), %al
+    test $0x20, %al
+    jz   2b
+    sub  $5, %dx
     movb (%ebx), %al
     outb %al, %dx
     incl %ebx
@@ -63,7 +68,7 @@ BEGIN_FUNC(huge_page_check)
     call hang
 
 huge_page_error_string:
-    .string "Huge page not supported by the processor"
+    .string "Huge page not supported by the processor\r\n"
     .set huge_page_error_size, . - huge_page_error_string
 END_FUNC(huge_page_check)
 #endif /* CONFIG_HUGE_PAGE */
@@ -122,6 +127,7 @@ BEGIN_FUNC(setup_pml4)
     ret
 END_FUNC(setup_pml4)
 
+#ifdef CONFIG_SUPPORT_PCID
 BEGIN_FUNC(pcid_check)
     movl $0x1, %eax
     xorl %ecx, %ecx
@@ -136,7 +142,7 @@ BEGIN_FUNC(pcid_check)
     call hang
 
 pcid_error_string:
-    .string "PCIDs not supported by the processor"
+    .string "PCIDs not supported by the processor\r\n"
     .set pcid_error_size, . - pcid_error_string
 END_FUNC(pcid_check)
 
@@ -154,9 +160,10 @@ BEGIN_FUNC(invpcid_check)
     call  hang
 
 invpcid_error_string:
-    .string "INVPCID instruction not supported by the processor"
+    .string "INVPCID instruction not supported by the processor\r\n"
     .set invpcid_error_size, . - invpcid_error_string
 END_FUNC(invpcid_check)
+#endif /* CONFIG_SUPPORT_PCID */
 
 BEGIN_FUNC(syscall_check)
     movl $0x80000001, %eax
@@ -172,7 +179,7 @@ BEGIN_FUNC(syscall_check)
     call  hang
 
 syscall_error_string:
-    .string "SYSCALL/SYSRET instruction not supported by the processor"
+    .string "SYSCALL/SYSRET instruction not supported by the processor\r\n"
     .set syscall_error_size, . - syscall_error_string
 END_FUNC(syscall_check)
 
@@ -195,11 +202,12 @@ BEGIN_FUNC(fsgsbase_enable)
     call hang
 
 fsgsbase_error_string:
-    .string "fsgsbase instructions not supported by the processor"
+    .string "fsgsbase instructions not supported by the processor\r\n"
     .set fsgsbase_error_size, . - fsgsbase_error_string
 END_FUNC(fsgsbase_enable)
 #endif /* CONFIG_FSGSBASE_INST */
 
+#ifdef CONFIG_SYSCALL
 BEGIN_FUNC(syscall_enable)
     call syscall_check
     /* Set SCE (bit 0) in the extended feature MSR. */
@@ -209,6 +217,7 @@ BEGIN_FUNC(syscall_enable)
     wrmsr
     ret
 END_FUNC(syscall_enable)
+#endif /* CONFIG_SYSCALL */
 
 BEGIN_FUNC(enable_x64_mode)
 #ifdef CONFIG_SUPPORT_PCID
@@ -227,8 +236,10 @@ BEGIN_FUNC(enable_x64_mode)
     rdmsr
     orl $0x100, %eax
     wrmsr
-    /* Set PG (bit 31) of cr0 to enable paging. */
     movl %cr0, %eax
+    /* Enable caches by clearing bits 29 and 30 of CR0. */
+    andl $0x9fffffff, %eax
+    /* Set PG (bit 31) of cr0 to enable paging. */
     orl $0x80000000, %eax
     movl %eax, %cr0
 #ifdef CONFIG_SUPPORT_PCID
@@ -264,7 +275,7 @@ END_FUNC(common_init)
 
 BEGIN_FUNC(_start)
     /* Assume we are MultiBooted, e.g. by GRUB.
-     * While not immediately checked, the magic number is checked prior to 
+     * While not immediately checked, the magic number is checked prior to
      * Multiboot dependent operations. */
     movl %eax, %edi /* multiboot_magic    */
     movl %ebx, %esi /* multiboot_info_ptr */
@@ -290,18 +301,14 @@ BEGIN_FUNC(_start)
 END_FUNC(_start)
 
 .code64
-.align 4096
 BEGIN_FUNC(_start64)
     /* Leave phys code behind and jump to the high kernel virtual address. */
     movabs $_entry_64, %rax
     jmp *%rax
 END_FUNC(_start64)
 
-.section .phys.data
-_gdt64_ptr:
-    .word (3 * 8) - 1
-    .long _gdt64
 
+.section .phys.data, "aw", @progbits
 .align 16
 _gdt64:
     .quad 0x0000000000000000
@@ -318,12 +325,17 @@ _gdt64:
     .byte   0
     .byte   0
 
-.section .phys.bss
+
+_gdt64_ptr:
+    .word (3 * 8) - 1
+    .long _gdt64
+
+.section .phys.bss, "aw", @nobits
 .align 4096
 _boot_pd:
     .fill 16384
 
-.section .boot.text
+.section .boot.text, "ax", @progbits
 
 BEGIN_FUNC(_entry_64)
     /* Update our stack pointer. */
@@ -343,7 +355,7 @@ BEGIN_FUNC(_entry_64)
     jmp boot_sys
 END_FUNC(_entry_64)
 
-.section .phys.text
+.section .phys.text, "ax", @progbits
 
 #ifdef ENABLE_SMP_SUPPORT
 
@@ -405,7 +417,7 @@ _boot_gdt:
 .global boot_cpu_end
 boot_cpu_end:
 
-.section .boot.text
+.section .boot.text, "ax", @progbits
 
 BEGIN_FUNC(_entry_ap64)
     /* Get the index of this cpu. */

@@ -4,7 +4,7 @@
 -- SPDX-License-Identifier: BSD-2-Clause
 --
 
-#include <autoconf.h>
+#include <sel4/config.h>
 
 base 32
 
@@ -87,4 +87,5 @@ block Timeout {
     field seL4_FaultType 4
 }
 #endif
+
 #include <sel4/arch/shared_types.bf>

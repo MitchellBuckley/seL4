@@ -21,8 +21,7 @@
 #include <smp/ipi.h>
 
 exception_t decodeIRQControlInvocation(word_t invLabel, word_t length,
-                                       cte_t *srcSlot, extra_caps_t excaps,
-                                       word_t *buffer)
+                                       cte_t *srcSlot, word_t *buffer)
 {
     if (invLabel == IRQIssueIRQHandler) {
         word_t index, depth, irq_w;
@@ -32,7 +31,7 @@ exception_t decodeIRQControlInvocation(word_t invLabel, word_t length,
         lookupSlot_ret_t lu_ret;
         exception_t status;
 
-        if (length < 3 || excaps.excaprefs[0] == NULL) {
+        if (length < 3 || current_extra_caps.excaprefs[0] == NULL) {
             current_syscall_error.type = seL4_TruncatedMessage;
             return EXCEPTION_SYSCALL_ERROR;
         }
@@ -41,7 +40,7 @@ exception_t decodeIRQControlInvocation(word_t invLabel, word_t length,
         index = getSyscallArg(1, buffer);
         depth = getSyscallArg(2, buffer);
 
-        cnodeCap = excaps.excaprefs[0]->cap;
+        cnodeCap = current_extra_caps.excaprefs[0]->cap;
 
         status = Arch_checkIRQ(irq_w);
         if (status != EXCEPTION_NONE) {
@@ -72,7 +71,7 @@ exception_t decodeIRQControlInvocation(word_t invLabel, word_t length,
         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
         return invokeIRQControl(irq, destSlot, srcSlot);
     } else {
-        return Arch_decodeIRQControlInvocation(invLabel, length, srcSlot, excaps, buffer);
+        return Arch_decodeIRQControlInvocation(invLabel, length, srcSlot, buffer);
     }
 }
 
@@ -84,8 +83,7 @@ exception_t invokeIRQControl(irq_t irq, cte_t *handlerSlot, cte_t *controlSlot)
     return EXCEPTION_NONE;
 }
 
-exception_t decodeIRQHandlerInvocation(word_t invLabel, irq_t irq,
-                                       extra_caps_t excaps)
+exception_t decodeIRQHandlerInvocation(word_t invLabel, irq_t irq)
 {
     switch (invLabel) {
     case IRQAckIRQ:
@@ -97,12 +95,12 @@ exception_t decodeIRQHandlerInvocation(word_t invLabel, irq_t irq,
         cap_t ntfnCap;
         cte_t *slot;
 
-        if (excaps.excaprefs[0] == NULL) {
+        if (current_extra_caps.excaprefs[0] == NULL) {
             current_syscall_error.type = seL4_TruncatedMessage;
             return EXCEPTION_SYSCALL_ERROR;
         }
-        ntfnCap = excaps.excaprefs[0]->cap;
-        slot = excaps.excaprefs[0];
+        ntfnCap = current_extra_caps.excaprefs[0]->cap;
+        slot = current_extra_caps.excaprefs[0];
 
         if (cap_get_capType(ntfnCap) != cap_notification_cap ||
             !cap_notification_cap_get_capNtfnCanSend(ntfnCap)) {
@@ -136,16 +134,34 @@ exception_t decodeIRQHandlerInvocation(word_t invLabel, irq_t irq,
 void invokeIRQHandler_AckIRQ(irq_t irq)
 {
 #ifdef CONFIG_ARCH_RISCV
+#if !defined(CONFIG_PLAT_QEMU_RISCV_VIRT)
+    /* QEMU has a bug where interrupts must be
+     * immediately claimed, which is done in getActiveIRQ. For other
+     * platforms, the claim can wait and be done here.
+     */
     plic_complete_claim(irq);
+#endif
 #else
+
 #if defined ENABLE_SMP_SUPPORT && defined CONFIG_ARCH_ARM
     if (IRQ_IS_PPI(irq) && IRQT_TO_CORE(irq) != getCurrentCPUIndex()) {
+#ifdef CONFIG_ARM_GIC_V3_SUPPORT
+        /* According to the GICv3 spec, SPIs can be deactivated from any PE,
+         * but SGIs and PPIs must be deactivated from their target PE.
+         */
+        doRemoteDeactivatePrivateInterrupt(IRQT_TO_CORE(irq), IRQT_TO_IDX(irq));
+#else /* CONFIG_ARM_GIC_V3_SUPPORT */
         doRemoteMaskPrivateInterrupt(IRQT_TO_CORE(irq), false, IRQT_TO_IDX(irq));
+#endif /* CONFIG_ARM_GIC_V3_SUPPORT */
         return;
     }
 #endif
-    maskInterrupt(false, irq);
-#endif
+    if (config_set(CONFIG_ARM_GIC_V3_SUPPORT)) {
+        deactivateInterrupt(irq);
+    } else {
+        maskInterrupt(false, irq);
+    }
+#endif /* CONFIG_ARCH_RISCV */
 }
 
 void invokeIRQHandler_SetIRQHandler(irq_t irq, cap_t cap, cte_t *slot)
@@ -184,21 +200,25 @@ void deletedIRQHandler(irq_t irq)
 void handleInterrupt(irq_t irq)
 {
     if (unlikely(IRQT_TO_IRQ(irq) > maxIRQ)) {
-        /* mask, ack and pretend it didn't happen. We assume that because
-         * the interrupt controller for the platform returned this IRQ that
-         * it is safe to use in mask and ack operations, even though it is
-         * above the claimed maxIRQ. i.e. we're assuming maxIRQ is wrong */
+        /* The interrupt number is out of range. Pretend it did not happen by
+         * handling it like an inactive interrupt (mask and ack). We assume this
+         * is acceptable, because the platform specific interrupt controller
+         * driver reported this interrupt. Maybe the value maxIRQ is just wrong
+         * or set to a lower value because the interrupts are unused.
+         */
         printf("Received IRQ %d, which is above the platforms maxIRQ of %d\n", (int)IRQT_TO_IRQ(irq), (int)maxIRQ);
         maskInterrupt(true, irq);
         ackInterrupt(irq);
         return;
     }
+
     switch (intStateIRQTable[IRQT_TO_IDX(irq)]) {
     case IRQSignal: {
+        /* Merging the variable declaration and initialization into one line
+         * requires an update in the proofs first. Might be a c89 legacy.
+         */
         cap_t cap;
-
         cap = intStateIRQNode[IRQT_TO_IDX(irq)].cap;
-
         if (cap_get_capType(cap) == cap_notification_cap &&
             cap_notification_cap_get_capNtfnCanSend(cap)) {
             sendSignal(NTFN_PTR(cap_notification_cap_get_capNtfnPtr(cap)),
@@ -209,8 +229,11 @@ void handleInterrupt(irq_t irq)
 #endif
         }
 #ifndef CONFIG_ARCH_RISCV
-        maskInterrupt(true, irq);
+        if (!config_set(CONFIG_ARM_GIC_V3_SUPPORT)) {
+            maskInterrupt(true, irq);
+        }
 #endif
+
         break;
     }
 
@@ -235,10 +258,9 @@ void handleInterrupt(irq_t irq)
         break;
 
     case IRQInactive:
-        /*
-         * This case shouldn't happen anyway unless the hardware or
-         * platform code is broken. Hopefully masking it again should make
-         * the interrupt go away.
+        /* This case shouldn't happen anyway unless the hardware or platform
+         * code is broken. Hopefully masking it again should make the interrupt
+         * go away.
          */
         maskInterrupt(true, irq);
 #ifdef CONFIG_IRQ_REPORTING
@@ -251,6 +273,9 @@ void handleInterrupt(irq_t irq)
         fail("Invalid IRQ state");
     }
 
+    /* Every interrupt is ack'd, even if it is an inactive one. Rationale is,
+     * that for any interrupt reported by the platform specific code the generic
+     * kernel code does report here that it is done with handling it. */
     ackInterrupt(irq);
 }
 

@@ -144,9 +144,13 @@ cap_t CONST Arch_updateCapData(bool_t preserve, word_t data, cap_t cap)
 #ifdef CONFIG_IOMMU
     switch (cap_get_capType(cap)) {
     case cap_io_space_cap: {
-        io_space_capdata_t w = { { data } };
-        uint16_t PCIDevice = io_space_capdata_get_PCIDevice(w);
-        uint16_t domainID = io_space_capdata_get_domainID(w);
+        seL4_X86_IOSpace_CapData_t w = { { data } };
+        uint16_t PCIDevice = get_dev_id(
+                                 seL4_X86_IOSpace_CapData_get_pciBus(w),
+                                 seL4_X86_IOSpace_CapData_get_pciDev(w),
+                                 seL4_X86_IOSpace_CapData_get_pciFun(w)
+                             );
+        uint16_t domainID = seL4_X86_IOSpace_CapData_get_domainID(w);
         if (!preserve && cap_io_space_cap_get_capPCIDevice(cap) == 0 &&
             domainID >= x86KSFirstValidIODomain &&
             domainID != 0                        &&
@@ -507,7 +511,6 @@ exception_t Arch_decodeInvocation(
     cptr_t cptr,
     cte_t *slot,
     cap_t cap,
-    extra_caps_t excaps,
     bool_t call,
     word_t *buffer
 )
@@ -515,35 +518,35 @@ exception_t Arch_decodeInvocation(
     switch (cap_get_capType(cap)) {
     case cap_asid_control_cap:
     case cap_asid_pool_cap:
-        return decodeX86MMUInvocation(invLabel, length, cptr, slot, cap, excaps, buffer);
+        return decodeX86MMUInvocation(invLabel, length, cptr, slot, cap, call, buffer);
     case cap_io_port_control_cap:
-        return decodeX86PortControlInvocation(invLabel, length, cptr, slot, cap, excaps, buffer);
+        return decodeX86PortControlInvocation(invLabel, length, cptr, slot, cap, buffer);
     case cap_io_port_cap:
-        return decodeX86PortInvocation(invLabel, length, cptr, slot, cap, excaps, call, buffer);
+        return decodeX86PortInvocation(invLabel, length, cptr, slot, cap, call, buffer);
 #ifdef CONFIG_IOMMU
     case cap_io_space_cap:
         return decodeX86IOSpaceInvocation(invLabel, cap);
     case cap_io_page_table_cap:
-        return decodeX86IOPTInvocation(invLabel, length, slot, cap, excaps, buffer);
+        return decodeX86IOPTInvocation(invLabel, length, slot, cap, buffer);
 #endif
 #ifdef CONFIG_VTX
     case cap_vcpu_cap:
-        return decodeX86VCPUInvocation(invLabel, length, cptr, slot, cap, excaps, buffer);
+        return decodeX86VCPUInvocation(invLabel, length, cptr, slot, cap, call, buffer);
     case cap_ept_pml4_cap:
     case cap_ept_pdpt_cap:
     case cap_ept_pd_cap:
     case cap_ept_pt_cap:
-        return decodeX86EPTInvocation(invLabel, length, cptr, slot, cap, excaps, buffer);
+        return decodeX86EPTInvocation(invLabel, length, cptr, slot, cap, buffer);
 #endif
     default:
-        return Mode_decodeInvocation(invLabel, length, cptr, slot, cap, excaps, buffer);
+        return Mode_decodeInvocation(invLabel, length, cptr, slot, cap, call, buffer);
     }
 }
 
 void Arch_prepareThreadDelete(tcb_t *thread)
 {
     /* Notify the lazy FPU module about this thread's deletion. */
-    fpuThreadDelete(thread);
+    fpuRelease(thread);
 }
 
 void Arch_postCapDeletion(cap_t cap)

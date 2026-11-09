@@ -40,7 +40,7 @@ void cleanInvalidateCacheRange_RAM(vptr_t start, vptr_t end, paddr_t pstart)
     /* Now clean and invalidate the L2 range */
     plat_cleanInvalidateL2Range(pstart, pstart + (end - start));
 
-    /* Finally clean and invalidate the L1 range. The extra clean is only strictly neccessary
+    /* Finally clean and invalidate the L1 range. The extra clean is only strictly necessary
      * in a multiprocessor environment to prevent a write being lost if another core is
      * attempting a store at the same time. As the range should already be clean asking
      * it to clean again should not affect performance */
@@ -137,6 +137,22 @@ void invalidateCacheRange_I(vptr_t start, vptr_t end, paddr_t pstart)
     vptr_t line;
     word_t index;
 
+#ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+    /* In cases where the hypervisor is supported, the virtual address passed
+     * to this function are kernel aliases for the underlying physical memory
+     * rather than the virtual address in the actual vspace. This works fine
+     * when the cache is PIPT, as the cache-line is indexed by physical address,
+     * and the alias maps to the same physical address. On VIPT this is not the
+     * case, and it is not possible to correctly index using an aliased address.
+     * As the only possible fallback the entire cache is invalidated in this
+     * case, and for any other non-PIPT cache type.
+     */
+    if (!isICachePIPT()) {
+        invalidate_I_PoU();
+        return;
+    }
+#endif
+
     for (index = LINE_INDEX(start); index < LINE_INDEX(end) + 1; index++) {
         line = index << L1_CACHE_LINE_SIZE_BITS;
         invalidateByVA_I(line, pstart + (line - start));
@@ -161,6 +177,7 @@ void cleanCaches_PoU(void)
     dsb();
     invalidate_I_PoU();
     dsb();
+    isb();
 }
 
 void cleanInvalidateL1Caches(void)
@@ -170,6 +187,7 @@ void cleanInvalidateL1Caches(void)
     dsb();
     invalidate_I_PoU();
     dsb();
+    isb();
 }
 
 void arch_clean_invalidate_caches(void)

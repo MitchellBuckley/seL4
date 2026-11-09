@@ -18,7 +18,7 @@
 
 static inline CONST word_t ready_queues_index(word_t dom, word_t prio)
 {
-    if (CONFIG_NUM_DOMAINS > 1) {
+    if (numDomains > 1) {
         return dom * CONFIG_NUM_PRIORITIES + prio;
     } else {
         assert(dom == 0);
@@ -117,13 +117,13 @@ static inline bool_t PURE isRoundRobin(sched_context_t *sc)
 
 static inline bool_t isCurDomainExpired(void)
 {
-    return CONFIG_NUM_DOMAINS > 1 &&
-           ksDomainTime < (NODE_STATE(ksConsumed) + MIN_BUDGET);
+    return numDomains > 1 &&
+           ksDomainTime == 0;
 }
 
 static inline void commitTime(void)
 {
-    if (NODE_STATE(ksCurSC)->scRefillMax) {
+    if (likely(sc_active(NODE_STATE(ksCurSC)) && (NODE_STATE(ksCurSC) != NODE_STATE(ksIdleSC)))) {
         if (likely(NODE_STATE(ksConsumed) > 0)) {
             /* if this function is called the head refil must be sufficient to
              * charge ksConsumed */
@@ -138,21 +138,12 @@ static inline void commitTime(void)
                 refill_head(NODE_STATE(ksCurSC))->rAmount -= NODE_STATE(ksConsumed);
                 refill_tail(NODE_STATE(ksCurSC))->rAmount += NODE_STATE(ksConsumed);
             } else {
-                refill_split_check(NODE_STATE(ksConsumed));
+                refill_budget_check(NODE_STATE(ksConsumed));
             }
             assert(refill_sufficient(NODE_STATE(ksCurSC), 0));
             assert(refill_ready(NODE_STATE(ksCurSC)));
         }
         NODE_STATE(ksCurSC)->scConsumed += NODE_STATE(ksConsumed);
-    }
-    if (CONFIG_NUM_DOMAINS > 1) {
-        assert(ksDomainTime > NODE_STATE(ksConsumed));
-        assert(ksDomainTime - NODE_STATE(ksConsumed) >= MIN_BUDGET);
-        if (NODE_STATE(ksConsumed) < ksDomainTime) {
-            ksDomainTime -= NODE_STATE(ksConsumed);
-        } else {
-            ksDomainTime = 0;
-        }
     }
 
     NODE_STATE(ksConsumed) = 0llu;
@@ -162,12 +153,21 @@ static inline bool_t PURE isSchedulable(const tcb_t *thread)
 {
     return isRunnable(thread) &&
            thread->tcbSchedContext != NULL &&
-           thread->tcbSchedContext->scRefillMax > 0 &&
+           sc_active(thread->tcbSchedContext) &&
            !thread_state_get_tcbInReleaseQueue(thread->tcbState);
 }
 #else
 #define isSchedulable isRunnable
 #endif
+
+void Arch_switchToThread(tcb_t *tcb);
+void Arch_switchToIdleThread(void);
+void Arch_configureIdleThread(tcb_t *tcb);
+void Arch_activateIdleThread(tcb_t *tcb);
+void Arch_prepareNextDomain(void);
+void Arch_prepareSetDomain(tcb_t *tcb, dom_t dom);
+
+void NORETURN idle_thread(void);
 
 void configureIdleThread(tcb_t *tcb);
 void activateThread(void);
@@ -191,6 +191,7 @@ void schedule(void);
 void chooseThread(void);
 void switchToThread(tcb_t *thread);
 void switchToIdleThread(void);
+void prepareSetDomain(tcb_t *tptr, dom_t dom);
 void setDomain(tcb_t *tptr, dom_t dom);
 void setPriority(tcb_t *tptr, prio_t prio);
 void setMCPriority(tcb_t *tptr, prio_t mcp);
@@ -221,7 +222,7 @@ static inline void updateRestartPC(tcb_t *tcb)
 void endTimeslice(bool_t can_timeout_fault);
 
 /* called when a thread has used up its head refill */
-void chargeBudget(ticks_t consumed, bool_t canTimeoutFault, word_t core, bool_t isCurCPU);
+void chargeBudget(ticks_t consumed, bool_t canTimeoutFault);
 
 /* Update the kernels timestamp and stores in ksCurTime.
  * The difference between the previous kernel timestamp and the one just read
@@ -232,9 +233,30 @@ void chargeBudget(ticks_t consumed, bool_t canTimeoutFault, word_t core, bool_t 
  */
 static inline void updateTimestamp(void)
 {
-    time_t prev = NODE_STATE(ksCurTime);
+    ticks_t prev = NODE_STATE(ksCurTime);
     NODE_STATE(ksCurTime) = getCurrentTime();
-    NODE_STATE(ksConsumed) += (NODE_STATE(ksCurTime) - prev);
+    assert(NODE_STATE(ksCurTime) < MAX_RELEASE_TIME);
+    ticks_t consumed = (NODE_STATE(ksCurTime) - prev);
+    NODE_STATE(ksConsumed) += consumed;
+    if (numDomains > 1) {
+        if ((consumed + MIN_BUDGET) >= ksDomainTime) {
+            ksDomainTime = 0;
+        } else {
+            ksDomainTime -= consumed;
+        }
+    }
+
+}
+
+/*
+ * Check if domain time has expired
+ */
+static inline void checkDomainTime(void)
+{
+    if (unlikely(isCurDomainExpired())) {
+        NODE_STATE(ksReprogram) = true;
+        rescheduleRequired();
+    }
 }
 
 /* Check if the current thread/domain budget has expired.
@@ -249,22 +271,15 @@ static inline bool_t checkBudget(void)
     /* currently running thread must have available capacity */
     assert(refill_ready(NODE_STATE(ksCurSC)));
 
-    ticks_t capacity = refill_capacity(NODE_STATE(ksCurSC), NODE_STATE(ksConsumed));
-    /* if the budget isn't enough, the timeslice for this SC is over. For
-     * round robin threads this is sufficient, however for periodic threads
-     * we also need to check there is space to schedule the replenishment - if the refill
-     * is full then the timeslice is also over as the rest of the budget is forfeit. */
-    if (likely(capacity >= MIN_BUDGET && (isRoundRobin(NODE_STATE(ksCurSC)) ||
-                                          !refill_full(NODE_STATE(ksCurSC))))) {
+    /* if the budget isn't enough, the timeslice for this SC is over. */
+    if (likely(refill_sufficient(NODE_STATE(ksCurSC), NODE_STATE(ksConsumed)))) {
         if (unlikely(isCurDomainExpired())) {
-            NODE_STATE(ksReprogram) = true;
-            rescheduleRequired();
             return false;
         }
         return true;
     }
 
-    chargeBudget(NODE_STATE(ksConsumed), true, CURRENT_CPU_INDEX(), true);
+    chargeBudget(NODE_STATE(ksConsumed), true);
     return false;
 }
 
@@ -295,5 +310,11 @@ void awaken(void);
 /* Place the thread bound to this scheduling context in the release queue
  * of periodic threads waiting for budget recharge */
 void postpone(sched_context_t *sc);
-#endif
 
+static inline void setThreadStateBlockedOnReply(tcb_t *tptr, reply_t *reply)
+{
+    thread_state_ptr_set_tsType(&tptr->tcbState, ThreadState_BlockedOnReply);
+    thread_state_ptr_set_replyObject(&tptr->tcbState, REPLY_REF(reply));
+    scheduleTCB(tptr);
+}
+#endif

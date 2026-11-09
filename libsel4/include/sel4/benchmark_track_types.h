@@ -6,24 +6,25 @@
 
 #pragma once
 
+#include <sel4/config.h>
 #include <stdint.h>
-
-#ifdef HAVE_AUTOCONF
-#include <autoconf.h>
-#endif
 
 #if (defined CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES || defined CONFIG_DEBUG_BUILD)
 
 /* the following code can be used at any point in the kernel
- * to determine detail about the kernel entry point */
+ * to determine detail about the kernel entry point.
+ * Note that all these values must fit in 3 bits for the `seL4_Word path: 3`
+ * bitfield below.
+ */
 typedef enum {
+    /* The kernel doesn't know why */
+    Entry_Unknown,
     Entry_Interrupt,
     Entry_UnknownSyscall,
     Entry_UserLevelFault,
     Entry_DebugFault,
     Entry_VMFault,
     Entry_Syscall,
-    Entry_UnimplementedDevice,
 #ifdef CONFIG_ARCH_ARM
     Entry_VCPUFault,
 #endif
@@ -65,4 +66,3 @@ typedef struct benchmark_syscall_log_entry {
 } benchmark_track_kernel_entry_t;
 
 #endif /* CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES || CONFIG_DEBUG_BUILD */
-

@@ -43,12 +43,12 @@ void deleteEPTASID(asid_t asid, ept_pml4e_t *ept)
 {
     asid_pool_t *poolPtr;
 
-    poolPtr = x86KSASIDTable[asid >> asidLowBits];
+    poolPtr = x86KSASIDTable[ASID_HIGH(asid)];
     if (poolPtr != NULL) {
-        asid_map_t asid_map = poolPtr->array[asid & MASK(asidLowBits)];
+        asid_map_t asid_map = poolPtr->array[ASID_LOW(asid)];
         if (asid_map_get_type(asid_map) == asid_map_asid_map_ept &&
             (ept_pml4e_t *)asid_map_asid_map_ept_get_ept_root(asid_map) == ept) {
-            poolPtr->array[asid & MASK(asidLowBits)] = asid_map_asid_map_none_new();
+            poolPtr->array[ASID_LOW(asid)] = asid_map_asid_map_none_new();
         }
     }
 }
@@ -179,17 +179,59 @@ static lookupEPTPTSlot_ret_t lookupEPTPTSlot(ept_pml4e_t *pml4, vptr_t vptr)
 
 static ept_cache_options_t eptCacheFromVmAttr(vm_attributes_t vmAttr)
 {
-    /* PAT cache options are 1-1 with ept_cache_options. But need to
-       verify user has specified a sensible option */
+    /* Need to sanitise user input, vmAttr will not have been verified at this point. */
     ept_cache_options_t option = vmAttr.words[0];
-    if (option != EPTUncacheable ||
-        option != EPTWriteCombining ||
-        option != EPTWriteThrough ||
+    if (option != EPTUncacheable &&
+        option != EPTWriteCombining &&
+        option != EPTWriteThrough &&
         option != EPTWriteBack) {
-        /* No failure mode is supported here, vmAttr settings should be verified earlier */
         option = EPTWriteBack;
     }
     return option;
+}
+
+static inline ept_pte_t CONST makeEPTPTEInvalid(void)
+{
+    return ept_pte_new(0, 0, 0, 0, 0, 0, 0);
+}
+
+static inline ept_pte_t CONST makeEPTPTE(paddr_t paddr, vm_attributes_t vm_attr, vm_rights_t vm_rights)
+{
+    /* EPT has no user/supervisor distinction, so kernel-only means no guest access */
+    if (vm_rights == VMKernelOnly) {
+        return makeEPTPTEInvalid();
+    }
+    return ept_pte_new(
+               paddr,                                          /* page_base_address    */
+               0,                                              /* avl_cte_depth        */
+               0,                                              /* ignore_pat           */
+               eptCacheFromVmAttr(vm_attr),                    /* type                 */
+               1,                                              /* execute              */
+               WritableFromVMRights(vm_rights),                /* write                */
+               1                                               /* read                 */
+           );
+}
+
+static inline ept_pde_t CONST makeEPTPDEInvalid(void)
+{
+    return ept_pde_ept_pde_2m_new(0, 0, 0, 0, 0, 0, 0);
+}
+
+static inline ept_pde_t CONST makeEPTPDELargePage(paddr_t paddr, vm_attributes_t vm_attr, vm_rights_t vm_rights)
+{
+    /* EPT has no user/supervisor distinction, so kernel-only means no guest access */
+    if (vm_rights == VMKernelOnly) {
+        return makeEPTPDEInvalid();
+    }
+    return ept_pde_ept_pde_2m_new(
+               paddr,                                          /* page_base_address    */
+               0,                                              /* avl_cte_depth        */
+               0,                                              /* ignore_pat           */
+               eptCacheFromVmAttr(vm_attr),                    /* type                 */
+               1,                                              /* execute              */
+               WritableFromVMRights(vm_rights),                /* write                */
+               1                                               /* read                 */
+           );
 }
 
 EPTPDPTMapped_ret_t EPTPDPTMapped(asid_t asid, vptr_t vptr, ept_pdpte_t *pdpt)
@@ -264,7 +306,6 @@ static exception_t decodeX86EPTPDPTInvocation(
     word_t length,
     cte_t *cte,
     cap_t cap,
-    extra_caps_t excaps,
     word_t *buffer
 )
 {
@@ -292,7 +333,7 @@ static exception_t decodeX86EPTPDPTInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    if (length < 2 || excaps.excaprefs[0] == NULL) {
+    if (length < 2 || current_extra_caps.excaprefs[0] == NULL) {
         userError("X86EPTPDPTMap: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -311,7 +352,7 @@ static exception_t decodeX86EPTPDPTInvocation(
      * this results in an error shifting by greater than 31 bits, so we manually
      * force a 64-bit variable to do the shifting with */
     vaddr = vaddr & ~(((uint64_t)1 << EPT_PML4_INDEX_OFFSET) - 1);
-    pml4Cap = excaps.excaprefs[0]->cap;
+    pml4Cap = current_extra_caps.excaprefs[0]->cap;
 
     if (cap_get_capType(pml4Cap) != cap_ept_pml4_cap) {
         userError("X86EPTPDPTMap: Not a valid EPT PML4.");
@@ -369,17 +410,16 @@ exception_t decodeX86EPTInvocation(
     cptr_t cptr,
     cte_t *cte,
     cap_t cap,
-    extra_caps_t excaps,
     word_t *buffer
 )
 {
     switch (cap_get_capType(cap)) {
     case cap_ept_pdpt_cap:
-        return decodeX86EPTPDPTInvocation(invLabel, length, cte, cap, excaps, buffer);
+        return decodeX86EPTPDPTInvocation(invLabel, length, cte, cap, buffer);
     case cap_ept_pd_cap:
-        return decodeX86EPTPDInvocation(invLabel, length, cte, cap, excaps, buffer);
+        return decodeX86EPTPDInvocation(invLabel, length, cte, cap, buffer);
     case cap_ept_pt_cap:
-        return decodeX86EPTPTInvocation(invLabel, length, cte, cap, excaps, buffer);
+        return decodeX86EPTPTInvocation(invLabel, length, cte, cap, buffer);
     default:
         fail("Invalid cap type");
     }
@@ -469,7 +509,6 @@ exception_t decodeX86EPTPDInvocation(
     word_t length,
     cte_t *cte,
     cap_t cap,
-    extra_caps_t excaps,
     word_t *buffer
 )
 {
@@ -497,7 +536,7 @@ exception_t decodeX86EPTPDInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    if (length < 2 || excaps.excaprefs[0] == NULL) {
+    if (length < 2 || current_extra_caps.excaprefs[0] == NULL) {
         userError("X86EPTPDMap: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -514,7 +553,7 @@ exception_t decodeX86EPTPDInvocation(
 
     vaddr = getSyscallArg(0, buffer);
     vaddr = vaddr & ~MASK(EPT_PDPT_INDEX_OFFSET);
-    pml4Cap = excaps.excaprefs[0]->cap;
+    pml4Cap = current_extra_caps.excaprefs[0]->cap;
 
     if (cap_get_capType(pml4Cap) != cap_ept_pml4_cap) {
         userError("X86EPTPDMap: Not a valid EPT pml4.");
@@ -657,7 +696,6 @@ exception_t decodeX86EPTPTInvocation(
     word_t length,
     cte_t *cte,
     cap_t cap,
-    extra_caps_t excaps,
     word_t *buffer
 )
 {
@@ -685,7 +723,7 @@ exception_t decodeX86EPTPTInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    if (length < 2 || excaps.excaprefs[0] == NULL) {
+    if (length < 2 || current_extra_caps.excaprefs[0] == NULL) {
         userError("X86EPTPT: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -702,7 +740,7 @@ exception_t decodeX86EPTPTInvocation(
 
     vaddr = getSyscallArg(0, buffer);
     vaddr = vaddr & ~MASK(EPT_PD_INDEX_OFFSET);
-    pml4Cap = excaps.excaprefs[0]->cap;
+    pml4Cap = current_extra_caps.excaprefs[0]->cap;
 
     if (cap_get_capType(pml4Cap) != cap_ept_pml4_cap ||
         !cap_ept_pml4_cap_get_capPML4IsMapped(pml4Cap)) {
@@ -792,7 +830,6 @@ exception_t decodeX86EPTPageMap(
     word_t length,
     cte_t *cte,
     cap_t cap,
-    extra_caps_t excaps,
     word_t *buffer)
 {
     word_t          vaddr;
@@ -811,7 +848,7 @@ exception_t decodeX86EPTPageMap(
     vaddr = vaddr & ~MASK(EPT_PT_INDEX_OFFSET);
     w_rightsMask = getSyscallArg(1, buffer);
     vmAttr = vmAttributesFromWord(getSyscallArg(2, buffer));
-    pml4Cap = excaps.excaprefs[0]->cap;
+    pml4Cap = current_extra_caps.excaprefs[0]->cap;
 
     capVMRights = cap_frame_cap_get_capFVMRights(cap);
 
@@ -887,14 +924,7 @@ exception_t decodeX86EPTPageMap(
             return EXCEPTION_SYSCALL_ERROR;
         }
 
-        pte = ept_pte_new(
-                  paddr,
-                  0,
-                  0,
-                  eptCacheFromVmAttr(vmAttr),
-                  1,
-                  WritableFromVMRights(vmRights),
-                  1);
+        pte = makeEPTPTE(paddr, vmAttr, vmRights);
 
         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
         return performEPTPageMapPTE(cap, cte, lu_ret.ptSlot, pte, pml4);
@@ -934,23 +964,8 @@ exception_t decodeX86EPTPageMap(
             return EXCEPTION_SYSCALL_ERROR;
         }
 
-        ept_pde_t pde1 = ept_pde_ept_pde_2m_new(
-                             paddr,
-                             0,
-                             0,
-                             eptCacheFromVmAttr(vmAttr),
-                             1,
-                             WritableFromVMRights(vmRights),
-                             1);
-
-        ept_pde_t pde2 = ept_pde_ept_pde_2m_new(
-                             paddr + BIT(EPT_PD_INDEX_OFFSET),
-                             0,
-                             0,
-                             eptCacheFromVmAttr(vmAttr),
-                             1,
-                             WritableFromVMRights(vmRights),
-                             1);
+        ept_pde_t pde1 = makeEPTPDELargePage(paddr, vmAttr, vmRights);
+        ept_pde_t pde2 = makeEPTPDELargePage(paddr + BIT(EPT_PD_INDEX_OFFSET), vmAttr, vmRights);
 
         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
         return performEPTPageMapPDE(cap, cte, lu_ret.pdSlot, pde1, pde2, pml4);
@@ -991,7 +1006,7 @@ void unmapEPTPage(vm_page_size_t page_size, asid_t asid, vptr_t vptr, void *pptr
             return;
         }
 
-        *lu_ret.ptSlot = ept_pte_new(0, 0, 0, 0, 0, 0, 0);
+        *lu_ret.ptSlot = makeEPTPTEInvalid();
         break;
     }
     case X86_LargePage: {
@@ -1011,14 +1026,14 @@ void unmapEPTPage(vm_page_size_t page_size, asid_t asid, vptr_t vptr, void *pptr
             return;
         }
 
-        lu_ret.pdSlot[0] = ept_pde_ept_pde_2m_new(0, 0, 0, 0, 0, 0, 0);
+        lu_ret.pdSlot[0] = makeEPTPDEInvalid();
 
         if (LARGE_PAGE_BITS != EPT_PD_INDEX_OFFSET) {
             assert(ept_pde_ptr_get_page_size(lu_ret.pdSlot + 1) == ept_pde_ept_pde_2m);
             assert(ept_pde_ept_pde_2m_ptr_get_read(lu_ret.pdSlot + 1));
             assert(ept_pde_ept_pde_2m_ptr_get_page_base_address(lu_ret.pdSlot + 1) == addr + BIT(21));
 
-            lu_ret.pdSlot[1] = ept_pde_ept_pde_2m_new(0, 0, 0, 0, 0, 0, 0);
+            lu_ret.pdSlot[1] = makeEPTPDEInvalid();
         }
         break;
     }

@@ -99,20 +99,17 @@ typedef struct asid_pool asid_pool_t;
 
 #define HW_ASID_SIZE_BITS 1
 
-#define ASID_POOL_INDEX_BITS seL4_ASIDPoolIndexBits
 #define ASID_BITS (asidHighBits+asidLowBits)
 
 #define nASIDPools BIT(asidHighBits)
 
-#define ASID_LOW(a) (a & MASK(asidLowBits))
-#define ASID_HIGH(a) ((a >> asidLowBits) & MASK(asidHighBits))
+#define ASID_LOW(a) ((a) & MASK(asidLowBits))
+#define ASID_HIGH(a) ((a) >> asidLowBits)
 
 static inline cap_t CONST cap_small_frame_cap_set_capFMappedASID(cap_t cap, word_t asid)
 {
-    cap = cap_small_frame_cap_set_capFMappedASIDLow(cap,
-                                                    asid & MASK(asidLowBits));
-    return cap_small_frame_cap_set_capFMappedASIDHigh(cap,
-                                                      (asid >> asidLowBits) & MASK(asidHighBits));
+    cap = cap_small_frame_cap_set_capFMappedASIDLow(cap, ASID_LOW(asid));
+    return cap_small_frame_cap_set_capFMappedASIDHigh(cap, ASID_HIGH(asid));
 }
 
 static inline word_t CONST cap_small_frame_cap_get_capFMappedASID(cap_t cap)
@@ -123,10 +120,8 @@ static inline word_t CONST cap_small_frame_cap_get_capFMappedASID(cap_t cap)
 
 static inline cap_t CONST cap_frame_cap_set_capFMappedASID(cap_t cap, word_t asid)
 {
-    cap = cap_frame_cap_set_capFMappedASIDLow(cap,
-                                              asid & MASK(asidLowBits));
-    return cap_frame_cap_set_capFMappedASIDHigh(cap,
-                                                (asid >> asidLowBits) & MASK(asidHighBits));
+    cap = cap_frame_cap_set_capFMappedASIDLow(cap, ASID_LOW(asid));
+    return cap_frame_cap_set_capFMappedASIDHigh(cap, ASID_HIGH(asid));
 }
 
 static inline word_t CONST cap_frame_cap_get_capFMappedASID(cap_t cap)
@@ -298,7 +293,11 @@ static inline word_t CONST cap_get_archCapSizeBits(cap_t cap)
     case cap_vcpu_cap:
         return VCPU_SIZE_BITS;
 #endif
-#ifdef CONFIG_ARM_SMMU
+#ifndef CONFIG_ENABLE_SMP_SUPPORT
+    case cap_sgi_signal_cap:
+        return 0;
+#endif
+#ifdef CONFIG_TK1_SMMU
     case cap_io_page_table_cap:
         return seL4_IOPageTableBits;
 #endif
@@ -339,8 +338,12 @@ static inline bool_t CONST cap_get_archCapIsPhysical(cap_t cap)
     case cap_vcpu_cap:
         return true;
 #endif
+#ifndef CONFIG_ENABLE_SMP_SUPPORT
+    case cap_sgi_signal_cap:
+        return false;
+#endif
 
-#ifdef CONFIG_ARM_SMMU
+#ifdef CONFIG_TK1_SMMU
     case cap_io_page_table_cap:
         return true;
 #endif
@@ -379,8 +382,12 @@ static inline void *CONST cap_get_archCapPtr(cap_t cap)
     case cap_vcpu_cap:
         return VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap));
 #endif
+#ifndef CONFIG_ENABLE_SMP_SUPPORT
+    case cap_sgi_signal_cap:
+        return NULL;
+#endif
 
-#ifdef CONFIG_ARM_SMMU
+#ifdef CONFIG_TK1_SMMU
     case cap_io_page_table_cap:
         return (void *)(cap_io_page_table_cap_get_capIOPTBasePtr(cap));
 #endif

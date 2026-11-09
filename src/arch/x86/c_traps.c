@@ -35,20 +35,14 @@ void VISIBLE NORETURN c_handle_interrupt(int irq, int syscall)
         x86_enable_ibrs();
     }
 
-    /* Only grab the lock if we are not handeling 'int_remote_call_ipi' interrupt
+    /* Only grab the lock if we are not handling 'int_remote_call_ipi' interrupt
      * also flag this lock as IRQ lock if handling the irq interrupts. */
     NODE_LOCK_IF(irq != int_remote_call_ipi,
                  irq >= int_irq_min && irq <= int_irq_max);
 
     c_entry_hook();
 
-    if (irq == int_unimpl_dev) {
-        handleFPUFault();
-#ifdef TRACK_KERNEL_ENTRIES
-        ksKernelEntry.path = Entry_UnimplementedDevice;
-        ksKernelEntry.word = irq;
-#endif
-    } else if (irq == int_page_fault) {
+    if (irq == int_page_fault) {
         /* Error code is in Error. Pull out bit 5, which is whether it was instruction or data */
         vm_fault_type_t type = (NODE_STATE(ksCurThread)->tcbArch.tcbContext.registers[Error] >> 4u) & 1u;
 #ifdef TRACK_KERNEL_ENTRIES
@@ -126,6 +120,9 @@ void NORETURN slowpath(syscall_t syscall)
         ksKernelEntry.path = Entry_UnknownSyscall;
         /* ksKernelEntry.word word is already set to syscall */
 #endif /* TRACK_KERNEL_ENTRIES */
+        /* Contrary to the name, this handles all non-standard syscalls used in
+         * debug builds also.
+         */
         handleUnknownSyscall(syscall);
     } else {
 #ifdef TRACK_KERNEL_ENTRIES
@@ -150,6 +147,16 @@ void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t sy
         x86_enable_ibrs();
     }
 
+    /* Must happen before NODE_LOCK_SYS so that lock exit via IPI stall restores
+       the correct program counter. */
+    if (config_set(CONFIG_SYSENTER)) {
+        /* increment NextIP to skip sysenter */
+        NODE_STATE(ksCurThread)->tcbArch.tcbContext.registers[NextIP] += 2;
+    } else {
+        /* set FaultIP */
+        setRegister(NODE_STATE(ksCurThread), FaultIP, getRegister(NODE_STATE(ksCurThread), NextIP) - 2);
+    }
+
     NODE_LOCK_SYS;
 
     c_entry_hook();
@@ -158,14 +165,6 @@ void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t sy
     benchmark_debug_syscall_start(cptr, msgInfo, syscall);
     ksKernelEntry.is_fastpath = 1;
 #endif /* TRACK_KERNEL_ENTRIES */
-
-    if (config_set(CONFIG_SYSENTER)) {
-        /* increment NextIP to skip sysenter */
-        NODE_STATE(ksCurThread)->tcbArch.tcbContext.registers[NextIP] += 2;
-    } else {
-        /* set FaultIP */
-        setRegister(NODE_STATE(ksCurThread), FaultIP, getRegister(NODE_STATE(ksCurThread), NextIP) - 2);
-    }
 
 #ifdef CONFIG_FASTPATH
     if (syscall == (syscall_t)SysCall) {
@@ -206,10 +205,12 @@ void VISIBLE NORETURN c_handle_vmexit(void)
      * This needs to happen before the entry hook which will try to
      * restore the registers without having a means to determine whether
      * they may have been dirtied by a VM exit. */
+#ifndef CONFIG_X86_64_VTX_64BIT_GUESTS
     tcb_t *cur_thread = NODE_STATE(ksCurThread);
     ARCH_NODE_STATE(x86KSCurrentGSBase) = -(word_t)1;
     ARCH_NODE_STATE(x86KSCurrentFSBase) = -(word_t)1;
-    x86_load_fsgs_base(cur_thread, SMP_TERNARY(getCurrentCPUIndex(), 0));
+    x86_load_fsgs_base(cur_thread, CURRENT_CPU_INDEX());
+#endif
 
     c_entry_hook();
     /* NODE_LOCK will get called in handleVmexit */

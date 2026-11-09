@@ -9,8 +9,18 @@
 
 #include <config.h>
 #include <arch/object/structures.h>
+#include <mode/hardware.h>
 
-#ifdef CONFIG_ENABLE_BENCHMARK
-#error "RISC-V doesn't support timestamp() function yet"
+#ifdef CONFIG_ENABLE_BENCHMARKS
+static inline timestamp_t timestamp(void)
+{
+    return riscv_read_cycle();
+}
+
+static inline void benchmark_arch_utilisation_reset(void)
+{
+    /* nothing here */
+}
+
 #endif /* CONFIG_ENABLE_BENCHMARK */
 

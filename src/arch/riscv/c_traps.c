@@ -23,28 +23,26 @@ void VISIBLE NORETURN restore_user_context(void)
 {
     word_t cur_thread_reg = (word_t) NODE_STATE(ksCurThread)->tcbArch.tcbContext.registers;
     c_exit_hook();
-    NODE_UNLOCK_IF_HELD;
 
 #ifdef ENABLE_SMP_SUPPORT
-    word_t sp;
-    asm volatile("csrr %0, sscratch" : "=r"(sp));
+    word_t sp = read_sscratch();
     sp -= sizeof(word_t);
     *((word_t *)sp) = cur_thread_reg;
 #endif
 
-
 #ifdef CONFIG_HAVE_FPU
-    lazyFPURestore(NODE_STATE(ksCurThread));
     set_tcb_fs_state(NODE_STATE(ksCurThread), isFpuEnable());
 #endif
+
+    NODE_UNLOCK_IF_HELD;
 
     asm volatile(
         "mv t0, %[cur_thread]       \n"
         LOAD_S " ra, (0*%[REGSIZE])(t0)  \n"
         LOAD_S "  sp, (1*%[REGSIZE])(t0)  \n"
         LOAD_S "  gp, (2*%[REGSIZE])(t0)  \n"
-        /* skip tp */
-        /* skip x5/t0 */
+        LOAD_S "  tp, (3*%[REGSIZE])(t0)  \n"
+        /* skip t0/x5, t1/x6, they are restored later */
         /* no-op store conditional to clear monitor state */
         /* this may succeed in implementations with very large reservations, but the saved ra is dead */
         "sc.w zero, zero, (t0)\n"
@@ -73,10 +71,6 @@ void VISIBLE NORETURN restore_user_context(void)
         LOAD_S "  t4, (28*%[REGSIZE])(t0) \n"
         LOAD_S "  t5, (29*%[REGSIZE])(t0) \n"
         LOAD_S "  t6, (30*%[REGSIZE])(t0) \n"
-        /* Get next restored tp */
-        LOAD_S "  t1, (3*%[REGSIZE])(t0)  \n"
-        /* get restored tp */
-        "add tp, t1, x0  \n"
         /* get sepc */
         LOAD_S "  t1, (34*%[REGSIZE])(t0)\n"
         "csrw sepc, t1  \n"
@@ -101,7 +95,7 @@ void VISIBLE NORETURN restore_user_context(void)
 
 void VISIBLE NORETURN c_handle_interrupt(void)
 {
-    NODE_LOCK_IRQ_IF(getActiveIRQ() != irq_remote_call_ipi);
+    NODE_LOCK_IRQ;
 
     c_entry_hook();
 
@@ -113,6 +107,17 @@ void VISIBLE NORETURN c_handle_interrupt(void)
 
 void VISIBLE NORETURN c_handle_exception(void)
 {
+    /* Any exception from S-mode is a kernel fault, not a user fault.
+     * Kernel faults should not exist, so print potential debug info and halt. */
+    if (read_sstatus() & SSTATUS_SPP) {
+#ifdef CONFIG_DEBUG_BUILD
+        printf("\n\nKERNEL ABORT (exception within s-mode)!\n");
+        printf("scause: 0x%"SEL4_PRIx_word", stval: 0x%"SEL4_PRIx_word"\n",
+               read_scause(), read_stval());
+#endif
+        halt();
+    }
+
     NODE_LOCK_SYS;
 
     c_entry_hook();
@@ -128,14 +133,6 @@ void VISIBLE NORETURN c_handle_exception(void)
         handleVMFaultEvent(scause);
         break;
     default:
-#ifdef CONFIG_HAVE_FPU
-        if (!isFpuEnable()) {
-            /* we assume the illegal instruction is caused by FPU first */
-            handleFPUFault();
-            setNextPC(NODE_STATE(ksCurThread), getRestartPC(NODE_STATE(ksCurThread)));
-            break;
-        }
-#endif
         handleUserLevelFault(scause, 0);
         break;
     }
@@ -144,12 +141,20 @@ void VISIBLE NORETURN c_handle_exception(void)
     UNREACHABLE();
 }
 
-void NORETURN slowpath(syscall_t syscall)
+void VISIBLE NORETURN slowpath(syscall_t syscall)
 {
-    /* check for undefined syscall */
     if (unlikely(syscall < SYSCALL_MIN || syscall > SYSCALL_MAX)) {
+#ifdef TRACK_KERNEL_ENTRIES
+        ksKernelEntry.path = Entry_UnknownSyscall;
+#endif /* TRACK_KERNEL_ENTRIES */
+        /* Contrary to the name, this handles all non-standard syscalls used in
+         * debug builds also.
+         */
         handleUnknownSyscall(syscall);
     } else {
+#ifdef TRACK_KERNEL_ENTRIES
+        ksKernelEntry.is_fastpath = 0;
+#endif /* TRACK KERNEL ENTRIES */
         handleSyscall(syscall);
     }
 
@@ -157,26 +162,56 @@ void NORETURN slowpath(syscall_t syscall)
     UNREACHABLE();
 }
 
-void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, word_t unused1, word_t unused2, word_t unused3,
-                                       word_t unused4, word_t reply, syscall_t syscall)
+#ifdef CONFIG_FASTPATH
+ALIGN(L1_CACHE_LINE_SIZE)
+#ifdef CONFIG_KERNEL_MCS
+void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo, word_t reply)
+#else
+void VISIBLE c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
+#endif
 {
     NODE_LOCK_SYS;
 
     c_entry_hook();
-
-#ifdef CONFIG_FASTPATH
-    if (syscall == (syscall_t)SysCall) {
-        fastpath_call(cptr, msgInfo);
-        UNREACHABLE();
-    } else if (syscall == (syscall_t)SysReplyRecv) {
+#ifdef TRACK_KERNEL_ENTRIES
+    benchmark_debug_syscall_start(cptr, msgInfo, SysReplyRecv);
+    ksKernelEntry.is_fastpath = 1;
+#endif /* DEBUG */
 #ifdef CONFIG_KERNEL_MCS
-        fastpath_reply_recv(cptr, msgInfo, reply);
+    fastpath_reply_recv(cptr, msgInfo, reply);
 #else
-        fastpath_reply_recv(cptr, msgInfo);
+    fastpath_reply_recv(cptr, msgInfo);
 #endif
-        UNREACHABLE();
-    }
-#endif /* CONFIG_FASTPATH */
+    UNREACHABLE();
+}
+
+ALIGN(L1_CACHE_LINE_SIZE)
+void VISIBLE c_handle_fastpath_call(word_t cptr, word_t msgInfo)
+{
+    NODE_LOCK_SYS;
+
+    c_entry_hook();
+#ifdef TRACK_KERNEL_ENTRIES
+    benchmark_debug_syscall_start(cptr, msgInfo, SysCall);
+    ksKernelEntry.is_fastpath = 1;
+#endif /* DEBUG */
+
+    fastpath_call(cptr, msgInfo);
+
+    UNREACHABLE();
+}
+#endif
+
+void VISIBLE NORETURN c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t syscall)
+{
+    NODE_LOCK_SYS;
+
+    c_entry_hook();
+#ifdef TRACK_KERNEL_ENTRIES
+    benchmark_debug_syscall_start(cptr, msgInfo, syscall);
+    ksKernelEntry.is_fastpath = 0;
+#endif /* DEBUG */
     slowpath(syscall);
+
     UNREACHABLE();
 }

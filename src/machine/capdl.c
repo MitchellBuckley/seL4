@@ -4,17 +4,18 @@
  * SPDX-License-Identifier: GPL-2.0-only
  */
 
+#include <config.h>
+
+#ifdef CONFIG_DEBUG_BUILD
+
 #include <machine/capdl.h>
 #include <machine/registerset.h>
 #include <machine/timer.h>
-#include <config.h>
 #include <string.h>
 #include <kernel/cspace.h>
 #ifdef CONFIG_KERNEL_MCS
 #include <kernel/sporadic.h>
 #endif
-
-#ifdef CONFIG_DEBUG_BUILD
 
 #define SEEN_SZ 256
 
@@ -28,7 +29,7 @@ int watermark = 0;
 void add_to_seen(cap_t c)
 {
     /* Won't work well if there're more than SEEN_SZ cnode */
-    if (watermark <= SEEN_SZ) {
+    if (watermark < SEEN_SZ) {
         seen_list[watermark] = c;
         watermark++;
     }
@@ -76,6 +77,8 @@ bool_t root_or_idle_tcb(tcb_t *tcb)
  * Print objects
  */
 
+#ifdef CONFIG_PRINTING
+
 void obj_tcb_print_attrs(tcb_t *tcb)
 {
     printf("(addr: 0x%lx, ip: 0x%lx, sp: 0x%lx, prio: %lu, max_prio: %lu",
@@ -103,18 +106,14 @@ void obj_tcb_print_attrs(tcb_t *tcb)
 
 #ifdef CONFIG_KERNEL_MCS
 
-/* to make compilers happy */
-#define REFILL_INDEX(sc, index) (((refill_t *) (SC_REF(sc) + sizeof(sched_context_t)))[index])
-#define REFILL_HEAD(sc) REFILL_INDEX((sc), (sc)->scRefillHead)
-
 static inline ticks_t sc_get_budget(sched_context_t *sc)
 {
-    ticks_t sum = REFILL_HEAD(sc).rAmount;
+    ticks_t sum = refill_head(sc)->rAmount;
     word_t current = sc->scRefillHead;
 
     while (current != sc->scRefillTail) {
         current = ((current == sc->scRefillMax - 1u) ? (0) : current + 1u);
-        sum += REFILL_INDEX(sc, current).rAmount;
+        sum += refill_index(sc, current)->rAmount;
     }
 
     return sum;
@@ -123,11 +122,13 @@ static inline ticks_t sc_get_budget(sched_context_t *sc)
 void obj_sc_print_attrs(cap_t sc_cap)
 {
     sched_context_t *sc = SC_PTR(cap_sched_context_cap_get_capSCPtr(sc_cap));
-    printf("(period: %lu, budget: %lu, %lu bits)\n",
-           (long unsigned int)ticksToUs(sc->scPeriod),
-           (long unsigned int)ticksToUs(sc_get_budget(sc)),
-           (word_t)cap_sched_context_cap_get_capSCSizeBits(sc_cap)
-          );
+    ticks_t period = sc->scPeriod;
+    ticks_t budget = sc_get_budget(sc);
+    printf("(period: %"PRIu64" us (%"PRIu64" ticks), budget: %"PRIu64 " us "
+           "(%"PRIu64" ticks), %"SEL4_PRIu_word" bits)\n",
+           ticksToUs(period), period,
+           ticksToUs(budget), budget,
+           (word_t)cap_sched_context_cap_get_capSCSizeBits(sc_cap));
 }
 #endif /* CONFIG_KERNEL_MCS */
 
@@ -144,7 +145,7 @@ void obj_ut_print_attrs(cte_t *slot, tcb_t *tcb)
     always accompanied by null mdb pointers */
     for (cte_t *nextPtr = CTE_PTR(mdb_node_get_mdbNext(slot->cteMDBNode));
          nextPtr && isMDBParentOf(slot, nextPtr);
-         nextPtr = CTE_PTR(mdb_node_get_mdbNext(slot->cteMDBNode))) {
+         nextPtr = CTE_PTR(mdb_node_get_mdbNext(nextPtr->cteMDBNode))) {
         if (!sameRegionAs(slot->cap, nextPtr->cap)) {
             /* TBD:
              * - this will print out the attributes of the cap, which it shouldn't
@@ -512,4 +513,6 @@ void print_object(cap_t cap)
     }
 }
 
-#endif
+#endif /* CONFIG_PRINTING */
+
+#endif /* CONFIG_DEBUG_BUILD */

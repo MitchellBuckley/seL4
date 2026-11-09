@@ -27,11 +27,11 @@ static inline void set_fs_off(void)
 
 #define FL "flw"
 #define FS "fsw"
-#define FP_REG_TYPES "4"
+#define FP_REG_BYTES "4"
 
 #endif
 
-extern bool_t isFPUEnabledCached[CONFIG_MAX_NUM_NODES];
+extern bool_t isFPUEnabled[CONFIG_MAX_NUM_NODES];
 
 static inline void set_fs_clean(void)
 {
@@ -59,8 +59,10 @@ static inline word_t read_sstatus_fs(void)
  * to actually enable/disable FPU accesses in
  * user mode.
  */
-static inline void saveFpuState(user_fpu_state_t *dest)
+static inline void saveFpuState(tcb_t *thread)
 {
+    user_fpu_state_t *dest = &thread->tcbArch.tcbContext.fpuState;
+
     set_fs_clean();
 
     asm volatile(
@@ -104,8 +106,10 @@ static inline void saveFpuState(user_fpu_state_t *dest)
     dest->fcsr = read_fcsr();
 }
 
-static inline void loadFpuState(user_fpu_state_t *src)
+static inline void loadFpuState(const tcb_t *thread)
 {
+    const user_fpu_state_t *src = &thread->tcbArch.tcbContext.fpuState;
+
     set_fs_clean();
 
     asm volatile(
@@ -148,19 +152,21 @@ static inline void loadFpuState(user_fpu_state_t *src)
     write_fcsr(src->fcsr);
 }
 
+/** MODIFIES: phantom_machine_state */
+/** DONT_TRANSLATE */
 static inline void enableFpu(void)
 {
-    isFPUEnabledCached[SMP_TERNARY(getCurrentCPUIndex(), 0)] = true;
+    isFPUEnabled[CURRENT_CPU_INDEX()] = true;
 }
 
 static inline void disableFpu(void)
 {
-    isFPUEnabledCached[SMP_TERNARY(getCurrentCPUIndex(), 0)] = false;
+    isFPUEnabled[CURRENT_CPU_INDEX()] = false;
 }
 
 static inline bool_t isFpuEnable(void)
 {
-    return isFPUEnabledCached[SMP_TERNARY(getCurrentCPUIndex(), 0)];
+    return isFPUEnabled[CURRENT_CPU_INDEX()];
 }
 
 static inline void set_tcb_fs_state(tcb_t *tcb, bool_t enabled)

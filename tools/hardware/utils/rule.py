@@ -39,11 +39,16 @@ class KernelRegionGroup:
 
     def __init__(self, region: Region, kernel_name: str, page_bits: int, max_size: int, condition_macro: str = None, user_ok: bool = False):
         self.macro = condition_macro
-        self.desc = region.owner.path
+        self.desc = region.owner.path if region.owner else 'dynamically generated region'
         self.kernel_offset = -1
         self.page_bits = page_bits
         self.labels = {}  # dict of label => offset within region.
         self.user_ok = user_ok
+
+        # The kernel only maps the first max_size bytes of the region, but
+        # reserves the entire region to not expose half a device to user level.
+        # self.reserved tracks the reservation (page aligned full region).
+        self.reserved = region.align_size(page_bits)
 
         region.size = min(max_size, region.size)
         aligned = region.align_size(page_bits)
@@ -63,6 +68,11 @@ class KernelRegionGroup:
         for (k, v) in other_group.labels.items():
             self.labels[k] = v
         self.desc += ', ' + other_group.desc
+        # For reservation, take the full union.
+        start = min(self.reserved.base, other_group.reserved.base)
+        end = max(self.reserved.base + self.reserved.size,
+                  other_group.reserved.base + other_group.reserved.size)
+        self.reserved = Region.from_range(start, end)
 
     def get_macro(self):
         ''' Get the #ifdef line for this region group '''
@@ -78,7 +88,7 @@ class KernelRegionGroup:
         self.kernel_offset = offset
         return offset + self.size
 
-    def get_labelled_addresses(self):
+    def get_labelled_addresses(self) -> Dict:
         ''' Get a dict of address -> label for the kernel '''
         ret = {}
         for (k, v) in self.labels.items():
@@ -94,11 +104,28 @@ class KernelRegionGroup:
         ''' Get this region group's description '''
         return self.desc
 
+    def get_reserved(self) -> Region:
+        ''' Get the full page-aligned physical extent of this device. This will
+            be reserved by the kernel and can be more than is mapped into the
+            kernel. '''
+        return self.reserved
+
     def __repr__(self):
         return 'KernelRegion(reg={},labels={})'.format(self.regions, self.labels)
 
     def __eq__(self, other):
         return other.base == self.base and other.size == self.size
+
+
+def get_reserved_regions(groups: List[KernelRegionGroup]) -> List[KernelRegionGroup]:
+    ''' Return the kernel device region groups whose device is reserved for the
+        kernel (not shared with user level), sorted by reserved address. '''
+    ret = sorted((g for g in groups if not g.user_ok), key=lambda g: g.get_reserved().base)
+    for prev, cur in zip(ret, ret[1:]):
+        if prev.get_reserved().overlaps(cur.get_reserved()):
+            raise ValueError('reserved kernel device regions {} ({}) and {} ({}) overlap'.format(
+                prev.get_reserved(), prev.get_desc(), cur.get_reserved(), cur.get_desc()))
+    return ret
 
 
 class KernelInterrupt:
@@ -168,14 +195,14 @@ class DeviceRule:
             kernel_name = rule['kernel']
             user = rule.get('user', False)
             macro = rule.get('macro', None)
-            max_size = 1 << self.config.get_page_bits()
+            max_size = 1 << self.config.get_device_page_bits()
             if 'kernel_size' in rule:
                 max_size = rule['kernel_size']
             elif max_size < reg.size:
                 logging.warning(
                     "Only mapping {}/{} bytes from node {}, region {}. Set kernel_size in YAML to silence.".format(max_size, reg.size, node.path, i))
             ret.append(KernelRegionGroup(reg, kernel_name,
-                                         self.config.get_page_bits(), max_size, macro, user))
+                                         self.config.get_device_page_bits(), max_size, macro, user))
 
         return ret
 

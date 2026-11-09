@@ -98,7 +98,7 @@ END_FUNC(arm_vector_table)
     mrs lr, elr_hyp
     str lr, [sp, #4]
     /* Store SPSR */
-    mrs lr, spsr_hyp
+    mrs lr, spsr
     str lr, [sp, #8]
     /* Store SP_usr */
     mrs lr, sp_usr
@@ -111,6 +111,10 @@ END_FUNC(arm_vector_table)
     str lr, [sp, #(PT_FaultIP - PT_SP)]
     /* Stack all user registers */
     push {r0-r12}
+    /* Save TPIDRURW and TPIDRURO, sp now points at the start of the user context. */
+    mrc p15, 0, r8, c13, c0, 2
+    mrc p15, 0, r9, c13, c0, 3
+    strd r8, r9, [sp, #PT_TPIDRURW]
     /* Load the kernel's real stack pointer */
     /* the hyp mode uses HTPIDR */
     mrc p15, 4, sp, c13, c0, 2
@@ -177,9 +181,10 @@ END_FUNC(arm_syscall)
  *********************************/
 
 BEGIN_FUNC(arm_hyp_prefetch_abort_exception)
-#ifdef DEBUG
+#ifdef CONFIG_DEBUG_BUILD
     mrc p15, 4, sp, c13, c0, 2
     mrs r0, elr_hyp
+    mov r1, lr
     blx kernelPrefetchAbort
 #endif
     mrc HSR(r9)    /* Get Hype Syndrome Register. */
@@ -188,7 +193,7 @@ BEGIN_FUNC(arm_hyp_prefetch_abort_exception)
 END_FUNC(arm_hyp_prefetch_abort_exception)
 
 BEGIN_FUNC(arm_hyp_data_abort_exception)
-#ifdef DEBUG
+#ifdef CONFIG_DEBUG_BUILD
     mrc p15, 4, sp, c13, c0, 2
     mrs r0, elr_hyp
     blx kernelDataAbort
@@ -199,9 +204,10 @@ BEGIN_FUNC(arm_hyp_data_abort_exception)
 END_FUNC(arm_hyp_data_abort_exception)
 
 BEGIN_FUNC(arm_hyp_undefined_inst_exception)
-#ifdef DEBUG
+#ifdef CONFIG_DEBUG_BUILD
     mrc p15, 4, sp, c13, c0, 2
     mrs r0, elr_hyp
+    mov r1, lr
     blx kernelUndefinedInstruction
 #endif
     mrc HSR(r9)    /* Get Hype Syndrome Register. */

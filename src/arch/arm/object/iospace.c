@@ -6,7 +6,7 @@
 
 #include <config.h>
 
-#ifdef CONFIG_ARM_SMMU
+#ifdef CONFIG_TK1_SMMU
 
 #include <api/syscall.h>
 #include <machine/io.h>
@@ -98,7 +98,7 @@ BOOT_CODE seL4_SlotRegion create_iospace_caps(cap_t root_cnode_cap)
     int num_smmu = plat_smmu_init();
 
     if (num_smmu == 0) {
-        printf("SMMU init failuer\n");
+        printf("SMMU init failure\n");
         return S_REG_EMPTY;
     }
 
@@ -143,7 +143,6 @@ exception_t decodeARMIOPTInvocation(
     uint32_t     length,
     cte_t       *slot,
     cap_t        cap,
-    extra_caps_t excaps,
     word_t      *buffer
 )
 {
@@ -157,6 +156,11 @@ exception_t decodeARMIOPTInvocation(
     lookupIOPDSlot_ret_t    lu_ret;
 
     if (invLabel == ARMIOPageTableUnmap) {
+        if (!isFinalCapability(slot)) {
+            userError("IOPTUnmap: Cannot unmap if more than one cap exists.");
+            current_syscall_error.type = seL4_RevokeFirst;
+            return EXCEPTION_SYSCALL_ERROR;
+        }
         deleteIOPageTable(slot->cap);
         slot->cap = cap_io_page_table_cap_set_capIOPTIsMapped(slot->cap, 0);
 
@@ -164,7 +168,7 @@ exception_t decodeARMIOPTInvocation(
         return EXCEPTION_NONE;
     }
 
-    if (excaps.excaprefs[0] == NULL || length < 1) {
+    if (current_extra_caps.excaprefs[0] == NULL || length < 1) {
         userError("IOPTInvocation: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -176,7 +180,7 @@ exception_t decodeARMIOPTInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    io_space     = excaps.excaprefs[0]->cap;
+    io_space     = current_extra_caps.excaprefs[0]->cap;
     io_address   = getSyscallArg(0, buffer) & ~MASK(SMMU_IOPD_INDEX_SHIFT);
 
     if (cap_io_page_table_cap_get_capIOPTIsMapped(cap)) {
@@ -245,7 +249,6 @@ exception_t decodeARMIOMapInvocation(
     uint32_t     length,
     cte_t       *slot,
     cap_t        cap,
-    extra_caps_t excaps,
     word_t      *buffer
 )
 {
@@ -260,7 +263,7 @@ exception_t decodeARMIOMapInvocation(
     seL4_CapRights_t    dma_cap_rights_mask;
     lookupIOPTSlot_ret_t lu_ret;
 
-    if (excaps.excaprefs[0] == NULL || length < 2) {
+    if (current_extra_caps.excaprefs[0] == NULL || length < 2) {
         userError("IOMap: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -280,7 +283,7 @@ exception_t decodeARMIOMapInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    io_space    = excaps.excaprefs[0]->cap;
+    io_space    = current_extra_caps.excaprefs[0]->cap;
     io_address  = getSyscallArg(1, buffer) & ~MASK(PAGE_BITS);
     paddr       = pptr_to_paddr((void *)cap_small_frame_cap_get_capFBasePtr(cap));
 
@@ -390,8 +393,8 @@ void deleteIOPageTable(cap_t io_pt_cap)
             return;
         }
 
-        if (isIOPDEValid(lu_ret.iopdSlot) &&
-            iopde_ptr_get_page_size(lu_ret.iopdSlot) == iopde_iopde_pt &&
+        if (!isIOPDEValid(lu_ret.iopdSlot) ||
+            iopde_ptr_get_page_size(lu_ret.iopdSlot) != iopde_iopde_pt ||
             iopde_iopde_pt_ptr_get_address(lu_ret.iopdSlot) != (pptr_to_paddr((void *)cap_io_page_table_cap_get_capIOPTBasePtr(
                                                                                   io_pt_cap)))) {
             return;
@@ -475,4 +478,4 @@ exception_t decodeARMIOSpaceInvocation(word_t invLabel, cap_t cap)
     current_syscall_error.type = seL4_IllegalOperation;
     return EXCEPTION_SYSCALL_ERROR;
 }
-#endif /* end of CONFIG_ARM_SMMU */
+#endif /* end of CONFIG_TK1_SMMU */

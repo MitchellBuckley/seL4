@@ -16,7 +16,7 @@ exception_t Arch_checkIRQ(word_t irq)
         current_syscall_error.type = seL4_RangeError;
         current_syscall_error.rangeErrorMin = 1;
         current_syscall_error.rangeErrorMax = maxIRQ;
-        userError("Rejecting request for IRQ %u. IRQ is out of range [1..maxIRQ].", (int)irq);
+        userError("Rejecting request for IRQ %u. IRQ is out of range [1..%u].", (int)irq, maxIRQ);
         return EXCEPTION_SYSCALL_ERROR;
     }
     return EXCEPTION_NONE;
@@ -31,11 +31,10 @@ static exception_t Arch_invokeIRQControl(irq_t irq, cte_t *handlerSlot, cte_t *c
 }
 
 exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length,
-                                            cte_t *srcSlot, extra_caps_t excaps,
-                                            word_t *buffer)
+                                            cte_t *srcSlot, word_t *buffer)
 {
     if (invLabel == RISCVIRQIssueIRQHandlerTrigger) {
-        if (length < 4 || excaps.excaprefs[0] == NULL) {
+        if (length < 4 || current_extra_caps.excaprefs[0] == NULL) {
             current_syscall_error.type = seL4_TruncatedMessage;
             return EXCEPTION_SYSCALL_ERROR;
         }
@@ -52,7 +51,7 @@ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length,
         word_t index = getSyscallArg(2, buffer);
         word_t depth = getSyscallArg(3, buffer);
 
-        cap_t cnodeCap = excaps.excaprefs[0]->cap;
+        cap_t cnodeCap = current_extra_caps.excaprefs[0]->cap;
 
         exception_t status = Arch_checkIRQ(irq_w);
         if (status != EXCEPTION_NONE) {

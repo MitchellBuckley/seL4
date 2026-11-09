@@ -60,7 +60,7 @@
 #define TLBBITMAP_PD_RESERVED (TLBBITMAP_ROOT_ENTRIES * BIT(seL4_LargePageBits))
 
 /* Calculate virtual address space reserved for dynamic log buffer mapping */
-#ifdef CONFIG_BENCHMARK_USE_KERNEL_LOG_BUFFER
+#ifdef CONFIG_KERNEL_LOG_BUFFER
 #define LOGBUFFER_PD_RESERVED BIT(seL4_LargePageBits)
 #else
 #define LOGBUFFER_PD_RESERVED UL_CONST(0)
@@ -75,15 +75,14 @@
 
 /* The physical memory address to use for mapping the kernel ELF */
 #define KERNEL_ELF_PADDR_BASE UL_CONST(0x00100000)
+/* For use by the linker (only integer constants allowed) */
+#define KERNEL_ELF_PADDR_BASE_RAW KERNEL_ELF_PADDR_BASE
 
 /* The base address in virtual memory to use for the kernel ELF mapping */
 #define KERNEL_ELF_BASE (PPTR_BASE + KERNEL_ELF_PADDR_BASE)
+/* For use by the linker (only integer constants allowed) */
+#define KERNEL_ELF_BASE_RAW (PPTR_BASE + KERNEL_ELF_PADDR_BASE_RAW)
 
 /* The base address in virtual memory to use for the kernel device
  * mapping region. These are mapped in the kernel page table. */
 #define KDEV_BASE KERNEL_PT_BASE
-
-/* For a 32-bit system there is no difference in how we translates
- * physical address for the kernel symbols or anything else */
-#define paddr_to_kpptr(x) paddr_to_pptr(x)
-#define kpptr_to_paddr(x) pptr_to_paddr(x)

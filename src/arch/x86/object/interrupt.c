@@ -29,7 +29,7 @@ void Arch_irqStateInit(void)
 }
 
 /* for x86, the IRQIssueIRQHandler is only allowed to
- * issue a hander for IRQ 0-15, the isa IRQs.
+ * issue a handler for IRQ 0-15, the isa IRQs.
  * Use getIRQHandlerIOAPIC and getIRQHandlerMSI for
  * the IRQs >= 16. Additionally these IRQs only exist
  * if using the legacy PIC interrupt
@@ -66,8 +66,7 @@ static exception_t invokeIssueIRQHandlerIOAPIC(irq_t irq, word_t ioapic, word_t 
     return Arch_invokeIRQControl(irq, handlerSlot, controlSlot, irqState);
 }
 
-exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_t *srcSlot, extra_caps_t excaps,
-                                            word_t *buffer)
+exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_t *srcSlot, word_t *buffer)
 {
     word_t index, depth;
     cte_t *destSlot;
@@ -92,14 +91,14 @@ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_
 
     /* check the common parameters */
 
-    if (length < 7 || excaps.excaprefs[0] == NULL) {
+    if (length < 7 || current_extra_caps.excaprefs[0] == NULL) {
         userError("IRQControl: Truncated message");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
     }
     index = getSyscallArg(0, buffer);
     depth = getSyscallArg(1, buffer);
-    cnodeCap = excaps.excaprefs[0]->cap;
+    cnodeCap = current_extra_caps.excaprefs[0]->cap;
     irq = getSyscallArg(6, buffer);
     if (irq > irq_user_max - irq_user_min) {
         userError("IRQControl: Invalid irq %ld should be between 0-%ld", (long)irq, (long)(irq_user_max - irq_user_min));
@@ -152,7 +151,7 @@ exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length, cte_
         word_t pci_func = getSyscallArg(4, buffer);
         word_t handle = getSyscallArg(5, buffer);
         x86_irq_state_t irqState;
-        /* until we support msi interrupt remaping through vt-d we ignore the
+        /* until we support msi interrupt remapping through vt-d we ignore the
          * vector and trust the user */
 
         if (pci_bus > PCI_BUS_MAX) {

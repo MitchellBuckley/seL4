@@ -7,8 +7,5 @@
 
 #pragma once
 
-#include <autoconf.h>
+#include <sel4/config.h>
 #include <sel4/simple_types.h>
-
-#define seL4_WordBits        32
-typedef seL4_Uint32 seL4_Word;

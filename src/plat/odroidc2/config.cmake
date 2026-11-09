@@ -4,8 +4,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 
-cmake_minimum_required(VERSION 3.7.2)
-
 declare_platform(odroidc2 KernelPlatformOdroidc2 PLAT_ODROIDC2 KernelSel4ArchAarch64)
 
 if(KernelPlatformOdroidc2)
@@ -17,7 +15,7 @@ if(KernelPlatformOdroidc2)
     list(APPEND KernelDTSList "tools/dts/odroidc2.dts")
     list(APPEND KernelDTSList "src/plat/odroidc2/overlay-odroidc2.dts")
     declare_default_headers(
-        TIMER_FREQUENCY 24000000llu
+        TIMER_FREQUENCY 24000000
         MAX_IRQ 250
         NUM_PPI 32
         TIMER drivers/timer/arm_generic.h
@@ -25,6 +23,7 @@ if(KernelPlatformOdroidc2)
         CLK_MAGIC 375299969u
         CLK_SHIFT 53u
         KERNEL_WCET 10u
+        TIMER_PRECISION 1u
     )
 endif()
 

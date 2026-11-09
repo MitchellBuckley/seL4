@@ -13,6 +13,22 @@
 #include <arch/model/smp.h>
 #include <arch/machine.h>
 
+/*
+ * SYSEXIT  0F 35     ; Return to compatibility mode from fast system call.
+ * SYSEXITQ 48 0F 35  ; Return to 64-bit mode from fast system call.
+ *
+ * clang uses "sysexitq" and gcc uses "rex.w sysexit" to generate 0x48,0x0F,0x35
+ * only at gcc 12 or later "sysexitq" works on both compilers.
+ */
+#if (defined(__clang__))
+#define SYSEXITQ "sysexitq"
+#elif defined(__GNUC__)
+#define SYSEXITQ "rex.w sysexit"
+#else
+#error "unsupported compiler"
+#endif
+
+
 static inline cr3_t makeCR3(paddr_t addr, word_t pcid)
 {
     return cr3_new(addr, config_set(CONFIG_SUPPORT_PCID) ? pcid : 0);
@@ -121,15 +137,6 @@ void x64_install_tss(uint32_t tss_sel);
 void handle_fastsyscall(void);
 
 void init_syscall_msrs(void);
-
-/* Get current stack pointer */
-static inline void *get_current_esp(void)
-{
-    word_t stack;
-    void *result;
-    asm volatile("movq %[stack_address], %[result]" : [result] "=r"(result) : [stack_address] "r"(&stack));
-    return result;
-}
 
 typedef struct invpcid_desc {
     uint64_t    asid;
@@ -331,6 +338,6 @@ static inline word_t x86_read_gs_base_impl(void)
 
 static inline void x86_set_tls_segment_base(word_t tls_base)
 {
-    x86_write_fs_base(tls_base, SMP_TERNARY(getCurrentCPUIndex(), 0));
+    x86_write_fs_base(tls_base, CURRENT_CPU_INDEX());
 }
 

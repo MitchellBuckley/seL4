@@ -5,7 +5,5 @@
  */
 
 #pragma once
-#ifdef HAVE_AUTOCONF
-#include <autoconf.h>
-#endif
 
+#include <sel4/config.h>

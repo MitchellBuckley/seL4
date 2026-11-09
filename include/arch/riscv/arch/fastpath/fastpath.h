@@ -15,14 +15,17 @@
 #include <api/types.h>
 #include <smp/lock.h>
 #include <arch/machine/hardware.h>
+#include <arch/model/statedata.h>
 #include <machine/fpu.h>
 
 void slowpath(syscall_t syscall)
 NORETURN;
 
+static inline
 void fastpath_call(word_t cptr, word_t r_msgInfo)
 NORETURN;
 
+static inline
 #ifdef CONFIG_KERNEL_MCS
 void fastpath_reply_recv(word_t cptr, word_t r_msgInfo, word_t reply)
 #else
@@ -39,6 +42,14 @@ static inline void FORCE_INLINE switchToThread_fp(tcb_t *thread, pte_t *vroot, p
     asid_t asid = (asid_t)(stored_hw_asid.words[0]);
 
     setVSpaceRoot(addrFromPPtr(vroot), asid);
+
+#ifdef CONFIG_BENCHMARK_TRACK_UTILISATION
+    benchmark_utilisation_switch(NODE_STATE(ksCurThread), thread);
+#endif
+
+#ifdef CONFIG_HAVE_FPU
+    lazyFPURestore(thread);
+#endif
 
     NODE_STATE(ksCurThread) = thread;
 }
@@ -59,6 +70,16 @@ static inline bool_t isValidVTableRoot_fp(cap_t vspace_root_cap)
 {
     return cap_capType_equals(vspace_root_cap, cap_page_table_cap) &&
            cap_page_table_cap_get_capPTIsMapped(vspace_root_cap);
+}
+
+/* Fastpath version of findVSpaceForASID(). Returns NULL if the ASID does not resolve. */
+static inline pte_t *findVSpaceForASID_fp(asid_t asid)
+{
+    asid_pool_t *poolPtr = riscvKSASIDTable[ASID_HIGH(asid)];
+    if (unlikely(!poolPtr)) {
+        return NULL;
+    }
+    return poolPtr->array[ASID_LOW(asid)];
 }
 
 /* This is an accelerated check that msgLength, which appears
@@ -94,35 +115,36 @@ static inline int fastpath_reply_cap_check(cap_t cap)
 /** DONT_TRANSLATE */
 static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t msgInfo, tcb_t *cur_thread)
 {
-    NODE_UNLOCK_IF_HELD;
-
-#ifdef ENABLE_SMP_SUPPORT
-    word_t sp;
-    asm volatile("csrr %0, sscratch" : "=r"(sp));
-    sp -= sizeof(word_t);
-    *((word_t *)sp) = TCB_REF(cur_thread);
-#endif
-
     c_exit_hook();
 
-#ifdef CONFIG_HAVE_FPU
-    lazyFPURestore(NODE_STATE(ksCurThread));
-    set_tcb_fs_state(NODE_STATE(ksCurThread), isFpuEnable());
+    word_t cur_thread_regs = (word_t)cur_thread->tcbArch.tcbContext.registers;
+
+#ifdef ENABLE_SMP_SUPPORT
+    word_t sp = read_sscratch();
+    sp -= sizeof(word_t);
+    *((word_t *)sp) = cur_thread_regs;
 #endif
+
+#ifdef CONFIG_HAVE_FPU
+    set_tcb_fs_state(cur_thread, isFpuEnable());
+#endif
+
+    NODE_UNLOCK_IF_HELD;
 
     register word_t badge_reg asm("a0") = badge;
     register word_t msgInfo_reg asm("a1") = msgInfo;
-    register word_t cur_thread_reg asm("t0") = TCB_REF(cur_thread);
+    register word_t cur_thread_reg asm("t0") = cur_thread_regs;
 
     asm volatile(
         LOAD_S "  ra, (0*%[REGSIZE])(t0)  \n"
         LOAD_S "  sp, (1*%[REGSIZE])(t0)  \n"
         LOAD_S "  gp, (2*%[REGSIZE])(t0)  \n"
-        /* skip tp */
-        /* skip x5/t0 */
+        LOAD_S "  tp, (3*%[REGSIZE])(t0)  \n"
+        /* skip t0/x5, t1/x6, they are restored later */
         LOAD_S "  t2, (6*%[REGSIZE])(t0)  \n"
         LOAD_S "  s0, (7*%[REGSIZE])(t0)  \n"
         LOAD_S "  s1, (8*%[REGSIZE])(t0)  \n"
+        /* skip a0/x10, a1/x11, they have been restored already */
         LOAD_S "  a2, (11*%[REGSIZE])(t0) \n"
         LOAD_S "  a3, (12*%[REGSIZE])(t0) \n"
         LOAD_S "  a4, (13*%[REGSIZE])(t0) \n"
@@ -143,10 +165,6 @@ static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t m
         LOAD_S "  t4, (28*%[REGSIZE])(t0) \n"
         LOAD_S "  t5, (29*%[REGSIZE])(t0) \n"
         LOAD_S "  t6, (30*%[REGSIZE])(t0) \n"
-        /* Get next restored tp */
-        LOAD_S "  t1, (3*%[REGSIZE])(t0)  \n"
-        /* get restored tp */
-        "add tp, t1, x0  \n"
         /* get sepc */
         LOAD_S "  t1, (34*%[REGSIZE])(t0)\n"
         "csrw sepc, t1  \n"

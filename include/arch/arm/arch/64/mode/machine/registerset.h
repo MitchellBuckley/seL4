@@ -43,9 +43,19 @@
 /* ID_AA64PFR0_EL1 register */
 #define ID_AA64PFR0_EL1_FP      16     // HWCap for Floating Point
 #define ID_AA64PFR0_EL1_ASIMD   20     // HWCap for Advanced SIMD
+#define ID_AA64PFR0_EL1_RAS     28     // RAS extension
 
 /* CPACR_EL1 register */
-#define CPACR_EL1_FPEN          20     // FP regiters access
+#define CPACR_EL1_FPEN          20     // FP registers access
+
+/* CPTR_EL2 register, layout for HCR_EL2.E2H == 0 */
+#define CPTR_EL2_TCPAC          31     // Trap EL1 accesses to CPACR_EL1
+#define CPTR_EL2_TAM            30     // Trap activity monitor accesses (FEAT_AMUv1)
+#define CPTR_EL2_TTA            20     // Trap trace register accesses
+#define CPTR_EL2_TSM            12     // Trap SME accesses, RES1 without FEAT_SME
+#define CPTR_EL2_TFP            10     // Trap FP and Advanced SIMD accesses
+#define CPTR_EL2_TZ             8      // Trap SVE accesses, RES1 without FEAT_SVE
+#define CPTR_EL2_RES1           (BIT(13) | BIT(CPTR_EL2_TSM) | BIT(9) | BIT(CPTR_EL2_TZ) | 0xff)
 
 /*
  * We cannot allow async aborts in the verified kernel, but they are useful
@@ -142,9 +152,13 @@ enum _register {
     /* user readable/writable thread ID register.
      * name comes from the ARM manual */
     TPIDR_EL0                   = 35,
-    TLS_BASE                    = TPIDR_EL0,
     /* user readonly thread ID register. */
     TPIDRRO_EL0                 = 36,
+#ifdef CONFIG_ARM_TLS_REG_TPIDRU
+    TLS_BASE = TPIDR_EL0,
+#elif defined(CONFIG_ARM_TLS_REG_TPIDRURO)
+    TLS_BASE = TPIDRRO_EL0,
+#endif
     n_contextRegisters          = 37,
 };
 
@@ -232,6 +246,21 @@ extern const register_t msgRegisters[];
 extern const register_t frameRegisters[];
 extern const register_t gpRegisters[];
 
+#ifdef CONFIG_HARDWARE_DEBUG_API
+typedef struct debug_register_pair {
+    word_t cr, vr;
+} debug_register_pair_t;
+
+typedef struct user_breakpoint_state {
+    /* We don't use context comparisons */
+    debug_register_pair_t breakpoint[seL4_NumExclusiveBreakpoints],
+                          watchpoint[seL4_NumExclusiveWatchpoints];
+    uint32_t used_breakpoints_bf;
+    word_t n_instructions;
+    bool_t single_step_enabled;
+} user_breakpoint_state_t;
+#endif /* CONFIG_HARDWARE_DEBUG_API */
+
 #ifdef CONFIG_HAVE_FPU
 typedef struct user_fpu_state {
     uint64_t vregs[64];
@@ -240,10 +269,7 @@ typedef struct user_fpu_state {
 } user_fpu_state_t;
 #endif /* CONFIG_HAVE_FPU */
 
-/* ARM user-code context: size = 72 bytes
- * Or with hardware debug support built in:
- *      72 + sizeof(word_t) * (NUM_BPS + NUM_WPS) * 2
- *
+/*
  * The "word_t registers" member of this struct must come first, because in
  * head.S, we assume that an "ldr %0, =ksCurThread" will point to the beginning
  * of the current thread's registers. The assert below should help.
@@ -251,18 +277,34 @@ typedef struct user_fpu_state {
 struct user_context {
     word_t registers[n_contextRegisters];
 #ifdef CONFIG_HAVE_FPU
+    word_t _padding;
     user_fpu_state_t fpuState;
 #endif /* CONFIG_HAVE_FPU */
+#ifdef CONFIG_HARDWARE_DEBUG_API
+    user_breakpoint_state_t breakpointState;
+#endif /* CONFIG_HARDWARE_DEBUG_API */
 };
 typedef struct user_context user_context_t;
 
 unverified_compile_assert(registers_are_first_member_of_user_context,
                           OFFSETOF(user_context_t, registers) == 0)
 
+#ifdef CONFIG_HAVE_FPU
+/* Aligning saves one cycle per LDP/STP instruction: */
+unverified_compile_assert(vregs_are_16_bytes_aligned,
+                          OFFSETOF(user_context_t, fpuState) % 16 == 0)
+#endif
+
+#ifdef CONFIG_HARDWARE_DEBUG_API
+void Arch_initBreakpointContext(user_context_t *context);
+#endif
 
 static inline void Arch_initContext(user_context_t *context)
 {
     context->registers[SPSR_EL1] = PSTATE_USER;
+#ifdef CONFIG_HARDWARE_DEBUG_API
+    Arch_initBreakpointContext(context);
+#endif
 }
 
 #endif /* !__ASSEMBLER__ */

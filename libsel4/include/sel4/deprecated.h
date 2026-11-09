@@ -6,7 +6,9 @@
 
 #pragma once
 
-#include <sel4/macros.h>
+/* This header collects deprecated items that are no longer part of sel4.h. */
+
+#include <sel4/sel4.h>
 #include <sel4/arch/deprecated.h>
 #include <sel4/sel4_arch/deprecated.h>
 
@@ -27,6 +29,10 @@
 #define SEL4_VCPU_FAULT_LENGTH SEL4_DEPRECATE_MACRO(seL4_VCPUFault_Length)
 #define SEL4_VCPU_FAULT_LABEL SEL4_DEPRECATE_MACRO(seL4_Fault_VCPUFault)
 #endif /* CONFIG_ARM_HYPERVISOR_SUPPORT */
+
+#ifdef CONFIG_VTX
+#define SEL4_VMENTER_CALL_CONTROL_ENTRY_MR SEL4_DEPRECATE_MACRO(SEL4_VMENTER_CALL_INTERRUPT_INFO_MR)
+#endif /* CONFIG_VTX */
 
 typedef seL4_CapRights_t seL4_CapRights SEL4_DEPRECATED("use seL4_CapRights_t");
 
@@ -126,5 +132,3 @@ static inline SEL4_DEPRECATED("Use seL4_CNode_CapData_new().words[0]") seL4_Word
 {
     return seL4_CNode_CapData_new(guard, bits).words[0];
 }
-
-

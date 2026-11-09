@@ -392,7 +392,7 @@ static void setBpVaddrContext(tcb_t *t, uint16_t bp_num, word_t vaddr)
  *
  * @param uds Arch TCB register context structure.
  * @param bp_num Hardware breakpoint ID.
- * @param vaddr USerspace virtual address on which you'd like this breakpoing
+ * @param vaddr USerspace virtual address on which you'd like this breakpoint
  *        to trigger.
  * @param types One of the seL4_BreakpointType values.
  * @param size positive integer indicating the byte-range size that should
@@ -587,11 +587,9 @@ exception_t handleUserLevelDebugException(int int_vector)
     getAndResetActiveBreakpoint_t active_bp;
     testAndResetSingleStepException_t single_step_info;
 
-#if defined(CONFIG_DEBUG_BUILD) || defined(CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES)
+#ifdef TRACK_KERNEL_ENTRIES
     ksKernelEntry.path = Entry_UserLevelFault;
     ksKernelEntry.word = int_vector;
-#else
-    (void)int_vector;
 #endif /* DEBUG */
 
 #ifdef CONFIG_BENCHMARK_TRACK_KERNEL_ENTRIES

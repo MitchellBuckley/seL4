@@ -17,6 +17,11 @@
 *.blg
 *.toc
 *.mpx
+*.acn
+*.glo
+*.gls
+*.ilg
+*.ist
 
 tools/parsetab.py
 manual/env.tex
@@ -24,6 +29,7 @@ manual/manual.pdf
 manual/stage
 manual/doxygen-output
 manual/generated
+manual/generated_markdown
 
 # Emacs backups
 *~

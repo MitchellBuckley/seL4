@@ -5,7 +5,7 @@
  */
 
 #pragma once
-#include <autoconf.h>
+#include <sel4/config.h>
 
 #include <sel4/functions.h>
 
@@ -44,7 +44,7 @@ LIBSEL4_INLINE_FUNC void
 seL4_DebugPutChar(char c);
 
 /**
- * @xmlonly <manual name="Dump scheduler" label="sel4_dumpscheduler"/> @endxmlonly
+ * @xmlonly <manual name="Dump Scheduler" label="sel4_dumpscheduler"/> @endxmlonly
  * @brief Output the contents of the kernel scheduler.
  *
  * Dump the state of the all TCB objects to kernel serial output. This system call
@@ -87,14 +87,14 @@ seL4_DebugSnapshot(void);
 
 /**
  * @xmlonly <manual name="Cap Identify" label="sel4_debugcapidentify"/> @endxmlonly
- * @brief Identify the type of a capability in the current cspace.
+ * @brief Identify the type of a capability in the current CSpace.
  *
  * This debugging system call returns the type of capability in a capability
- * slot in the current cspace. The type returned is not a libsel4 type, but
+ * slot in the current CSpace. The type returned is not a libsel4 type, but
  * refers to an internal seL4 type. This can be looked up in a built kernel by
  * looking for the (generated) `enum cap_tag`, type `cap_tag_t`.
  *
- * @param cap A capability slot in the current cspace.
+ * @param cap A capability slot in the current CSpace.
  * @return The type of capability passed in.
  *
  */
@@ -118,7 +118,22 @@ seL4_DebugCapIdentify(seL4_CPtr cap);
  */
 LIBSEL4_INLINE_FUNC void
 seL4_DebugNameThread(seL4_CPtr tcb, const char *name);
-#if CONFIG_MAX_NUM_NODES > 1 && defined CONFIG_ARCH_ARM
+#if defined(CONFIG_ENABLE_SMP_SUPPORT)
+/**
+ * @xmlonly <manual name="Get thread affinity" label="sel4_debugthreadgetaffinity"/> @endxmlonly
+ * @brief Get the current affinity of a thread.
+ *
+ * This gets the value of the kernel's tcb_t->tcbAffinity field, which corresponds
+ * to the core (affinity) of the thread. If the thread is not running (e.g. blocked)
+ * this is the last core it ran on.
+ *
+ * @param tcb A capability to the tcb object for the thread to query.
+ *
+ */
+LIBSEL4_INLINE_FUNC seL4_Word
+seL4_DebugGetThreadAffinity(seL4_CPtr tcb);
+
+#if defined(CONFIG_ARCH_ARM)
 /**
  * @xmlonly <manual name="Send SGI 0-15" label="sel4_debugsendipi"/> @endxmlonly
  * @brief Sends arbitrary SGI.
@@ -131,8 +146,9 @@ seL4_DebugNameThread(seL4_CPtr tcb, const char *name);
  */
 LIBSEL4_INLINE_FUNC void
 seL4_DebugSendIPI(seL4_Uint8 target, unsigned irq);
-#endif
-#endif
+#endif /* CONFIG_ARCH_ARM */
+#endif /* CONFIG_ENABLE_SMP_SUPPORT */
+#endif /* CONFIG_DEBUG_BUILD */
 
 #ifdef CONFIG_DANGEROUS_CODE_INJECTION
 /**
@@ -215,7 +231,7 @@ seL4_BenchmarkFinalizeLog(void);
  * @brief Set log buffer.
  *
  * Provide a large frame object for the kernel to use as a log-buffer.
- * The object must not be device memory, and must be seL4_LargePageBits in size.
+ * The object must not be device memory, and must be `seL4_LargePageBits` in size.
  *
  * @param[in] frame_cptr A capability pointer to a user allocated frame of seL4_LargePage size.
  * @return A `seL4_IllegalOperation` error if `frame_cptr` is not valid and couldn't set the buffer.
@@ -317,7 +333,7 @@ seL4_BenchmarkResetAllThreadsUtilisation(void);
 
 #ifdef CONFIG_VTX
 /**
- * @xmlonly <manual name="VMEnter" label="sel4_vmenter"/> @endxmlonly
+ * @xmlonly <manual name="VM Enter" label="sel4_vmenter"/> @endxmlonly
  * @brief Change current thread to execute from its bound VCPU
  *
  * Changes the execution mode of the current thread from normal TCB execution, to
@@ -335,10 +351,10 @@ seL4_BenchmarkResetAllThreadsUtilisation(void);
  * The mapping of hardware register to message register is
  *      - `SEL4_VMENTER_CALL_EIP_MR` Address to start executing instructions at in the guest mode
  *      - `SEL4_VMENTER_CALL_CONTROL_PPC_MR` New value for the Primary Processor Based VM Execution Controls
- *      - `SEL4_VMENTER_CALL_CONTROL_ENTRY_MR` New value for the VM Entry Controls
+ *      - `SEL4_VMENTER_CALL_INTERRUPT_INFO_MR` New value for the VM Entry Interruption-Information
  *
  * On return these same three message registers will be filled with the values at the point
- * that the privlidged mode ceased executing. If this function returns with `SEL4_VMENTER_RESULT_FAULT`
+ * that the privileged mode ceased executing. If this function returns with `SEL4_VMENTER_RESULT_FAULT`
  * then the following additional message registers will be filled out
  *      - `SEL4_VMENTER_FAULT_REASON_MR`
  *      - `SEL4_VMENTER_FAULT_QUALIFICATION_MR`
@@ -374,14 +390,14 @@ seL4_VMEnter(seL4_Word *sender);
 
 #ifdef CONFIG_SET_TLS_BASE_SELF
 /**
- * @xmlonly <manual name="SetTLSBase" label="sel4_settlsbase"/> @endxmlonly
+ * @xmlonly <manual name="Set TLS Base" label="sel4_settlsbase"/> @endxmlonly
  * @brief Set the TLS base address and register of the currently executing thread.
  *
  * This stores the base address of the TLS region in the register
  * reserved for that purpose on the given platform.
  *
  * Each platform has a specific register reserved for tracking the
- * base address of the TLS region (as sepcified in the ELF standard) in
+ * base address of the TLS region (as specified in the ELF standard) in
  * a manner compatible with the TLS method used with that architecture.
  *
  * @param tls_base The new base address to store in the register.

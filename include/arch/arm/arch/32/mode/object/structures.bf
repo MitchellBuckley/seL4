@@ -8,7 +8,7 @@
 -- Default base size: uint32_t
 base 32
 
--- Including the common structures_32.bf is neccessary because
+-- Including the common structures_32.bf is necessary because
 -- we need the structures to be visible here when building
 -- the capType
 #include <object/structures_32.bf>
@@ -23,7 +23,7 @@ block small_frame_cap {
     field_high capFMappedAddress 20
 
     field capFIsDevice       1
-#ifdef CONFIG_ARM_SMMU
+#ifdef CONFIG_TK1_SMMU
     field capFIsIOSpace      1
     field capFMappedASIDHigh 6
 #else
@@ -102,7 +102,20 @@ block vcpu_cap {
 }
 #endif
 
-#ifdef CONFIG_ARM_SMMU
+#ifndef CONFIG_ENABLE_SMP_SUPPORT
+
+block sgi_signal_cap {
+    field capSGITarget      32
+
+    padding                 20
+    field capSGIIRQ         4
+    field capType           8
+}
+
+#endif
+
+
+#ifdef CONFIG_TK1_SMMU
 -- IO space caps
 -- each module has an engine that can be enabled
 -- the clients use the same module can be separately enabled
@@ -175,9 +188,12 @@ tagged_union cap capType {
 #endif /* CONFIG_ARM_HYPERVISOR_SUPPORT */
 
     -- we use the same names as for x86 IOMMU caps
-#ifdef CONFIG_ARM_SMMU
+#ifdef CONFIG_TK1_SMMU
     tag io_space_cap            0x1f
     tag io_page_table_cap       0x2f
+#endif
+#ifndef CONFIG_ENABLE_SMP_SUPPORT
+    tag sgi_signal_cap          0x3f
 #endif
 }
 
@@ -548,20 +564,14 @@ block dbg_dscr {
 block dbg_bcr {
     padding 3
     field addressMask 5
-#ifdef CONFIG_ARCH_ARM_V6
-    padding 1
-    field meaning 2
-    field enableLinking 1
-#else
     field breakpointType 4
-#endif
-    field linkedBrp 4
-    field secureStateControl 2
-    field hypeModeControl 1
+    field lbn 4
+    field ssc 2
+    field hmc 1
     padding 4
-    field byteAddressSelect 4
+    field bas 4
     padding 2
-    field supervisorAccess 2
+    field pmc 2
     field enabled 1
 }
 
@@ -570,18 +580,13 @@ block dbg_wcr {
     padding 3
     field addressMask 5
     padding 3
-    field enableLinking 1
-    field linkedBrp 4
-#ifndef CONFIG_ARCH_ARM_V6
-    field secureStateControl 2
-    field hypeModeControl 1
-    field byteAddressSelect 8
-#else
-    padding 7
-    field byteAddressSelect 4
-#endif
-    field loadStore 2
-    field supervisorAccess 2
+    field watchpointType 1
+    field lbn 4
+    field ssc 2
+    field hmc 1
+    field bas 8
+    field lsc 2
+    field pac 2
     field enabled 1
 }
 #endif /* CONFIG_HARDWARE_DEBUG_API */

@@ -12,29 +12,35 @@
 #include <mode/machine.h>
 
 
-#define CPACR_CP_10_SHIFT_POS        20
-#define CPACR_CP_11_SHIFT_POS        22
-#define CPACR_CP_ACCESS_DISABLE      0x0
-#define CPACR_CP_ACCESS_PL1          0x1
-#define CPACR_CP_ACCESS_PLX          0x3
+/* cpN access is a 2-bit field at bits [2N+1:2N], 0b11 is full PL0/PL1 access */
+#define CPACR_CP10                   (BIT(20) | BIT(21))
+#define CPACR_CP11                   (BIT(22) | BIT(23))
+#define CPACR_TRCDIS                 BIT(28)
+#define CPACR_D32DIS                 BIT(30)
+#define CPACR_ASEDIS                 BIT(31)
 
-#define CPACR_D32DIS_BIT             30
-#define CPACR_ASEDIS_BIT             31
+/* Full PL0 and PL1 access to cp10 and cp11 (VFP/Advanced SIMD), with bits
+ * D32DIS and ASEDIS cleared (=enable both features). */
+#define CPACR_FPU_ENABLE (CPACR_CP10 | CPACR_CP11)
+
+/* CPACR value for native threads and initial value for VCPUs.
+ *
+ * - cp10, cp11, ASEDIS, D32DIS: with CONFIG_HAVE_FPU, VFP and Advanced SIMD are
+ *   fully enabled for PL0 and PL1, and the kernel context-switches the FPU
+ *   state. When CONFIG_HAVE_FPU is disabled, FPU state is not saved and
+ *   restored and PL0 and PL1 access to cp10 and cp11 is disabled.
+ * - TRCDIS: always set, so PL0 and PL1 accesses to CP14 trace registers are
+ *   UNDEFINED.
+ * - cp0-cp9 (ARMv7 only, IMPLEMENTATION DEFINED coprocessors): no access.
+ * - All other bits are reserved and set to 0. */
+#ifdef CONFIG_HAVE_FPU
+#define CPACR_DEFAULT (CPACR_TRCDIS | CPACR_FPU_ENABLE)
+#else
+#define CPACR_DEFAULT CPACR_TRCDIS
+#endif
 
 #define FPSID_SW_BIT                 23
 #define FPSID_SUBARCH_SHIFT_POS      16
-
-#define FPEXC_EX_BIT                 31
-#define FPEXC_EN_BIT                 30
-
-#if defined(CONFIG_ARM_CORTEX_A7) || defined(CONFIG_ARM_CORTEX_A9)
-#define FPEXC_DEX_BIT                29
-#endif
-
-#define FPEXC_DEX_BIT                29
-#define FPEXC_FP2V_BIT               28
-
-extern bool_t isFPUEnabledCached[CONFIG_MAX_NUM_NODES];
 
 static void clearEnFPEXC(void)
 {
@@ -46,16 +52,11 @@ static void clearEnFPEXC(void)
 
 #if defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(CONFIG_HAVE_FPU)
 
-#define HCPTR_CP10_BIT  10
-#define HCPTR_CP11_BIT  11
-#define HCPTR_TASE_BIT  15
-#define HCPTR_MASK      ~(BIT(HCPTR_CP10_BIT) | BIT(HCPTR_CP11_BIT) | BIT(HCPTR_TASE_BIT))
-
 /* enable FPU accesses in Hyp mode */
 static inline void enableFpuInstInHyp(void)
 {
     if (!ARCH_NODE_STATE(armHSFPUEnabled)) {
-        setHCPTR(getHCPTR() & HCPTR_MASK);
+        setHCPTR(getHCPTR() & ~HCPTR_FPU_TRAPS);
         ARCH_NODE_STATE(armHSFPUEnabled) = true;
     }
 }
@@ -64,7 +65,7 @@ static inline void enableFpuInstInHyp(void)
 static inline void trapFpuInstToHyp(void)
 {
     if (ARCH_NODE_STATE(armHSFPUEnabled)) {
-        setHCPTR(getHCPTR() | ~HCPTR_MASK);
+        setHCPTR(getHCPTR() | HCPTR_FPU_TRAPS);
         ARCH_NODE_STATE(armHSFPUEnabled) = false;
     }
 }
@@ -88,33 +89,17 @@ static void setEnFPEXC(void)
     VMSR(FPEXC, fpexc);
 }
 /* Store state in the FPU registers into memory. */
-static inline void saveFpuState(user_fpu_state_t *dest)
+static inline void saveFpuState(tcb_t *thread)
 {
+    user_fpu_state_t *dest = &thread->tcbArch.tcbContext.fpuState;
     word_t fpexc;
 
-    /* Fetch FPEXC. */
-    VMRS(FPEXC, fpexc);
-
-#if defined(CONFIG_ARM_CORTEX_A7) || defined(CONFIG_ARM_CORTEX_A9)
-    /*
-    * Reset DEX bit to 0 in case a subarchitecture sets it.
-    * For example, Cortex-A7/A9 set this bit on deprecated vector VFP operations.
-    */
-    if (unlikely(fpexc & BIT(FPEXC_DEX_BIT))) {
-        fpexc &= ~BIT(FPEXC_DEX_BIT);
-        VMSR(FPEXC, fpexc);
-    }
-#endif
-
-    dest->fpexc = fpexc;
-
     if (config_set(CONFIG_ARM_HYPERVISOR_SUPPORT)) {
-        /* before touching the regsiters, we need to set the EN bit */
+        /* FPEXC belongs to the current VCPU and may have EN cleared by the
+         * guest. Save it, and set the EN bit before touching the registers. */
+        VMRS(FPEXC, fpexc);
         setEnFPEXC();
     }
-
-    /* We don't support asynchronous exceptions */
-    assert((dest->fpexc & BIT(FPEXC_EX_BIT)) == 0);
 
     if (isFPUD32SupportedCached) {
         register word_t regs_d16_d31 asm("ip") = (word_t) &dest->fpregs[16];
@@ -146,16 +131,14 @@ static inline void saveFpuState(user_fpu_state_t *dest)
 /* Enable the FPU to be used without faulting.
  * Required even if the kernel attempts to use the FPU.
  *
- * The FPEXC_EN bit is not set immediately in HYP mode for
- * the following reason:
- *
- *    A VM can set/clear the EN bit in the FPEXC in order to
- *    trap FPU accesses, implementing its own save/restore
- *    functions. Thus, we need to save the FPEXC without modifying
- *    it.
- *
+ * In HYP mode, FPEXC is VCPU state: it is switched in vcpu_enable() and
+ * vcpu_disable(), and native threads always have EN set. While a VCPU is
+ * active, FPEXC belongs to the guest, which may clear EN to trap FPU accesses
+ * itself, so it is left alone here. saveFpuState() and loadFpuState() only set
+ * EN temporarily and leave FPEXC as it was.
  */
-
+/** MODIFIES: phantom_machine_state */
+/** DONT_TRANSLATE */
 static inline void enableFpu(void)
 {
 #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
@@ -166,20 +149,19 @@ static inline void enableFpu(void)
 #else
     setEnFPEXC();
 #endif
-    isFPUEnabledCached[SMP_TERNARY(getCurrentCPUIndex(), 0)] = true;
-}
-
-/* Check if FPU is enable */
-static inline bool_t isFpuEnable(void)
-{
-    return isFPUEnabledCached[SMP_TERNARY(getCurrentCPUIndex(), 0)];
 }
 
 /* Load FPU state from memory into the FPU registers. */
-static inline void loadFpuState(user_fpu_state_t *src)
+static inline void loadFpuState(const tcb_t *thread)
 {
+    const user_fpu_state_t *src = &thread->tcbArch.tcbContext.fpuState;
+    word_t fpexc;
+
     if (config_set(CONFIG_ARM_HYPERVISOR_SUPPORT)) {
-        /* now we need to enable the EN bit in FPEXC */
+        /* FPEXC belongs to the current VCPU and may have EN cleared by the
+         * guest. Save it, and set the EN bit for kernel access before touching
+         * the registers. */
+        VMRS(FPEXC, fpexc);
         setEnFPEXC();
     }
     register word_t regs_d16_d31 asm("r2") = (word_t) &src->fpregs[16];
@@ -200,8 +182,10 @@ static inline void loadFpuState(user_fpu_state_t *src)
     /* Load FPSCR. */
     VMSR(FPSCR, src->fpscr);
 
-    /* Restore FPEXC. */
-    VMSR(FPEXC, src->fpexc);
+    if (config_set(CONFIG_ARM_HYPERVISOR_SUPPORT)) {
+        /* Restore the FPEXC. */
+        VMSR(FPEXC, fpexc);
+    }
 }
 
 #endif /* CONFIG_HAVE_FPU */
@@ -223,6 +207,5 @@ static inline void disableFpu(void)
     } else {
         clearEnFPEXC();
     }
-    isFPUEnabledCached[SMP_TERNARY(getCurrentCPUIndex(), 0)] = false;
 }
 

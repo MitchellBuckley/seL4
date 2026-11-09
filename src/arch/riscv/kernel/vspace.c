@@ -34,7 +34,7 @@ struct resolve_ret {
 };
 typedef struct resolve_ret resolve_ret_t;
 
-static exception_t performPageGetAddress(void *vbase_ptr);
+static exception_t performPageGetAddress(void *vbase_ptr, bool_t call);
 
 static word_t CONST RISCVGetWriteFromVMRights(vm_rights_t vm_rights)
 {
@@ -70,10 +70,10 @@ static pte_t pte_next(word_t phys_addr, bool_t is_leaf)
 
     return pte_new(ppn,
                    0,     /* sw */
-                   1,     /* dirty */
-                   1,     /* accessed */
+                   is_leaf ? 1 : 0,     /* dirty (leaf)/reserved (non-leaf) */
+                   is_leaf ? 1 : 0,     /* accessed (leaf)/reserved (non-leaf) */
                    1,     /* global */
-                   0,     /* user */
+                   is_leaf ? 0 : 0,     /* user (leaf)/reserved (non-leaf) */
                    exec,  /* execute */
                    write, /* write */
                    read,  /* read */
@@ -85,9 +85,22 @@ static pte_t pte_next(word_t phys_addr, bool_t is_leaf)
 
 BOOT_CODE void map_kernel_frame(paddr_t paddr, pptr_t vaddr, vm_rights_t vm_rights)
 {
+#if __riscv_xlen == 32
     paddr = ROUND_DOWN(paddr, RISCV_GET_LVL_PGSIZE_BITS(0));
     assert((paddr % RISCV_GET_LVL_PGSIZE(0)) == 0);
     kernel_root_pageTable[RISCV_GET_PT_INDEX(vaddr, 0)] = pte_next(paddr, true);
+#else
+    if (vaddr >= KDEV_BASE) {
+        /* Map devices in level 1 page table */
+        paddr = ROUND_DOWN(paddr, RISCV_GET_LVL_PGSIZE_BITS(1));
+        assert((paddr % RISCV_GET_LVL_PGSIZE(1)) == 0);
+        kernel_image_level1_dev_pt[RISCV_GET_PT_INDEX(vaddr, 1)] = pte_next(paddr, true);
+    } else {
+        paddr = ROUND_DOWN(paddr, RISCV_GET_LVL_PGSIZE_BITS(0));
+        assert((paddr % RISCV_GET_LVL_PGSIZE(0)) == 0);
+        kernel_root_pageTable[RISCV_GET_PT_INDEX(vaddr, 0)] = pte_next(paddr, true);
+    }
+#endif
 }
 
 BOOT_CODE VISIBLE void map_kernel_window(void)
@@ -95,6 +108,8 @@ BOOT_CODE VISIBLE void map_kernel_window(void)
     /* mapping of KERNEL_ELF_BASE (virtual address) to kernel's
      * KERNEL_ELF_PHYS_BASE  */
     assert(CONFIG_PT_LEVELS > 1 && CONFIG_PT_LEVELS <= 4);
+    /* Kernel image finishes before KDEV_BASE */
+    assert(KERNEL_ELF_TOP <= KDEV_BASE);
 
     /* kernel window starts at PPTR_BASE */
     word_t pptr = PPTR_BASE;
@@ -110,32 +125,41 @@ BOOT_CODE VISIBLE void map_kernel_window(void)
         pptr += RISCV_GET_LVL_PGSIZE(0);
         paddr += RISCV_GET_LVL_PGSIZE(0);
     }
-    /* now we should be mapping the 1GiB kernel base */
+    /* now map KERNEL_ELF_BASE to KERNEL_ELF_PADDR_BASE */
     assert(pptr == PPTR_TOP);
+    pptr = ROUND_DOWN(KERNEL_ELF_BASE, RISCV_GET_LVL_PGSIZE_BITS(0));
     paddr = ROUND_DOWN(KERNEL_ELF_PADDR_BASE, RISCV_GET_LVL_PGSIZE_BITS(0));
 
 #if __riscv_xlen == 32
     kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 0)] = pte_next(paddr, true);
     pptr += RISCV_GET_LVL_PGSIZE(0);
     paddr += RISCV_GET_LVL_PGSIZE(0);
+#ifdef CONFIG_KERNEL_LOG_BUFFER
+    kernel_root_pageTable[RISCV_GET_PT_INDEX(KS_LOG_PPTR, 0)] =
+        pte_next(kpptr_to_paddr(kernel_image_level1_log_buffer_pt), false);
+#endif
 #else
     word_t index = 0;
-    /* The kernel image are mapped twice, locating the two indexes in the
-     * root page table, pointing them to the same second level page table.
+    /* The kernel image is mapped twice, locating the two indexes in the
+     * root page table, pointing them to the same level 1 page table.
      */
     kernel_root_pageTable[RISCV_GET_PT_INDEX(KERNEL_ELF_PADDR_BASE + PPTR_BASE_OFFSET, 0)] =
-        pte_next(kpptr_to_paddr(kernel_image_level2_pt), false);
+        pte_next(kpptr_to_paddr(kernel_image_level1_pt), false);
     kernel_root_pageTable[RISCV_GET_PT_INDEX(pptr, 0)] =
-        pte_next(kpptr_to_paddr(kernel_image_level2_pt), false);
+        pte_next(kpptr_to_paddr(kernel_image_level1_pt), false);
     while (pptr < PPTR_TOP + RISCV_GET_LVL_PGSIZE(0)) {
-        kernel_image_level2_pt[index] = pte_next(paddr, true);
+        kernel_image_level1_pt[index] = pte_next(paddr, true);
         index++;
         pptr += RISCV_GET_LVL_PGSIZE(1);
         paddr += RISCV_GET_LVL_PGSIZE(1);
     }
+
+    /* Map kernel device page table */
+    kernel_root_pageTable[RISCV_GET_PT_INDEX(KDEV_BASE, 0)] =
+        pte_next(kpptr_to_paddr(kernel_image_level1_dev_pt), false);
 #endif
 
-    /* There should be 1GiB free where we put device mapping */
+    /* There should be free space where we put device mapping */
     assert(pptr == UINTPTR_MAX - RISCV_GET_LVL_PGSIZE(0) + 1);
     map_kernel_devices();
 }
@@ -158,10 +182,10 @@ BOOT_CODE void map_it_pt_cap(cap_t vspace_cap, cap_t pt_cap)
     *targetSlot = pte_new(
                       (addrFromPPtr(pt) >> seL4_PageBits),
                       0, /* sw */
-                      1, /* dirty */
-                      1, /* accessed */
+                      0, /* dirty (reserved non-leaf) */
+                      0, /* accessed (reserved non-leaf) */
                       0,  /* global */
-                      0,  /* user */
+                      0,  /* user (reserved non-leaf) */
                       0,  /* execute */
                       0,  /* write */
                       0,  /* read */
@@ -185,10 +209,10 @@ BOOT_CODE void map_it_frame_cap(cap_t vspace_cap, cap_t frame_cap)
     *targetSlot = pte_new(
                       (pptr_to_paddr(frame_pptr) >> seL4_PageBits),
                       0, /* sw */
-                      1, /* dirty */
-                      1, /* accessed */
+                      1, /* dirty (leaf) */
+                      1, /* accessed (leaf) */
                       0,  /* global */
-                      1,  /* user */
+                      1,  /* user (leaf) */
                       1,  /* execute */
                       1,  /* write */
                       1,  /* read */
@@ -286,8 +310,8 @@ BOOT_CODE void activate_kernel_vspace(void)
 BOOT_CODE void write_it_asid_pool(cap_t it_ap_cap, cap_t it_lvl1pt_cap)
 {
     asid_pool_t *ap = ASID_POOL_PTR(pptr_of_cap(it_ap_cap));
-    ap->array[IT_ASID] = PTE_PTR(pptr_of_cap(it_lvl1pt_cap));
-    riscvKSASIDTable[IT_ASID >> asidLowBits] = ap;
+    ap->array[ASID_LOW(IT_ASID)] = PTE_PTR(pptr_of_cap(it_lvl1pt_cap));
+    riscvKSASIDTable[ASID_HIGH(IT_ASID)] = ap;
 }
 
 /* ==================== BOOT CODE FINISHES HERE ==================== */
@@ -298,7 +322,7 @@ static findVSpaceForASID_ret_t findVSpaceForASID(asid_t asid)
     asid_pool_t        *poolPtr;
     pte_t     *vspace_root;
 
-    poolPtr = riscvKSASIDTable[asid >> asidLowBits];
+    poolPtr = riscvKSASIDTable[ASID_HIGH(asid)];
     if (!poolPtr) {
         current_lookup_fault = lookup_fault_invalid_root_new();
 
@@ -307,7 +331,7 @@ static findVSpaceForASID_ret_t findVSpaceForASID(asid_t asid)
         return ret;
     }
 
-    vspace_root = poolPtr->array[asid & MASK(asidLowBits)];
+    vspace_root = poolPtr->array[ASID_LOW(asid)];
     if (!vspace_root) {
         current_lookup_fault = lookup_fault_invalid_root_new();
 
@@ -420,8 +444,8 @@ void deleteASIDPool(asid_t asid_base, asid_pool_t *pool)
     /* Haskell error: "ASID pool's base must be aligned" */
     assert(IS_ALIGNED(asid_base, asidLowBits));
 
-    if (riscvKSASIDTable[asid_base >> asidLowBits] == pool) {
-        riscvKSASIDTable[asid_base >> asidLowBits] = NULL;
+    if (riscvKSASIDTable[ASID_HIGH(asid_base)] == pool) {
+        riscvKSASIDTable[ASID_HIGH(asid_base)] = NULL;
         setVMRoot(NODE_STATE(ksCurThread));
     }
 }
@@ -446,7 +470,7 @@ static exception_t performASIDControlInvocation(void *frame, cte_t *slot, cte_t 
     );
     /* Haskell error: "ASID pool's base must be aligned" */
     assert((asid_base & MASK(asidLowBits)) == 0);
-    riscvKSASIDTable[asid_base >> asidLowBits] = (asid_pool_t *)frame;
+    riscvKSASIDTable[ASID_HIGH(asid_base)] = (asid_pool_t *)frame;
 
     return EXCEPTION_NONE;
 }
@@ -462,7 +486,7 @@ static exception_t performASIDPoolInvocation(asid_t asid, asid_pool_t *poolPtr, 
 
     copyGlobalMappings(regionBase);
 
-    poolPtr->array[asid & MASK(asidLowBits)] = regionBase;
+    poolPtr->array[ASID_LOW(asid)] = regionBase;
 
     return EXCEPTION_NONE;
 }
@@ -471,10 +495,10 @@ void deleteASID(asid_t asid, pte_t *vspace)
 {
     asid_pool_t *poolPtr;
 
-    poolPtr = riscvKSASIDTable[asid >> asidLowBits];
-    if (poolPtr != NULL && poolPtr->array[asid & MASK(asidLowBits)] == vspace) {
+    poolPtr = riscvKSASIDTable[ASID_HIGH(asid)];
+    if (poolPtr != NULL && poolPtr->array[ASID_LOW(asid)] == vspace) {
         hwASIDFlush(asid);
-        poolPtr->array[asid & MASK(asidLowBits)] = NULL;
+        poolPtr->array[ASID_LOW(asid)] = NULL;
         setVMRoot(NODE_STATE(ksCurThread));
     }
 }
@@ -509,10 +533,10 @@ void unmapPageTable(asid_t asid, vptr_t vptr, pte_t *target_pt)
     *ptSlot = pte_new(
                   0,  /* phy_address */
                   0,  /* sw */
-                  0,  /* dirty */
-                  0,  /* accessed */
+                  0,  /* dirty (reserved non-leaf) */
+                  0,  /* accessed (reserved non-leaf) */
                   0,  /* global */
-                  0,  /* user */
+                  0,  /* user (reserved non-leaf) */
                   0,  /* execute */
                   0,  /* write */
                   0,  /* read */
@@ -619,6 +643,11 @@ vm_rights_t CONST maskVMRights(vm_rights_t vm_rights, seL4_CapRights_t cap_right
             return VMReadWrite;
         }
     }
+    if (vm_rights == VMReadWrite &&
+        !seL4_CapRights_get_capAllowRead(cap_rights_mask) &&
+        seL4_CapRights_get_capAllowWrite(cap_rights_mask)) {
+        userError("Attempted to make unsupported write only mapping");
+    }
     return VMKernelOnly;
 }
 
@@ -634,10 +663,10 @@ static pte_t CONST makeUserPTE(paddr_t paddr, bool_t executable, vm_rights_t vm_
         return pte_new(
                    paddr >> seL4_PageBits,
                    0, /* sw */
-                   1, /* dirty */
-                   1, /* accessed */
+                   1, /* dirty (leaf) */
+                   1, /* accessed (leaf) */
                    0, /* global */
-                   1, /* user */
+                   1, /* user (leaf) */
                    executable, /* execute */
                    RISCVGetWriteFromVMRights(vm_rights), /* write */
                    RISCVGetReadFromVMRights(vm_rights), /* read */
@@ -652,8 +681,7 @@ static inline bool_t CONST checkVPAlignment(vm_page_size_t sz, word_t w)
 }
 
 static exception_t decodeRISCVPageTableInvocation(word_t label, word_t length,
-                                                  cte_t *cte, cap_t cap, extra_caps_t extraCaps,
-                                                  word_t *buffer)
+                                                  cte_t *cte, cap_t cap, word_t *buffer)
 {
     if (label == RISCVPageTableUnmap) {
         if (unlikely(!isFinalCapability(cte))) {
@@ -684,7 +712,7 @@ static exception_t decodeRISCVPageTableInvocation(word_t label, word_t length,
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    if (unlikely(length < 2 || extraCaps.excaprefs[0] == NULL)) {
+    if (unlikely(length < 2 || current_extra_caps.excaprefs[0] == NULL)) {
         userError("RISCVPageTable: truncated message");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -697,7 +725,7 @@ static exception_t decodeRISCVPageTableInvocation(word_t label, word_t length,
     }
 
     word_t vaddr = getSyscallArg(0, buffer);
-    cap_t lvl1ptCap = extraCaps.excaprefs[0]->cap;
+    cap_t lvl1ptCap = current_extra_caps.excaprefs[0]->cap;
 
     if (unlikely(cap_get_capType(lvl1ptCap) != cap_page_table_cap ||
                  cap_page_table_cap_get_capPTIsMapped(lvl1ptCap) == asidInvalid)) {
@@ -737,7 +765,7 @@ static exception_t decodeRISCVPageTableInvocation(word_t label, word_t length,
     lookupPTSlot_ret_t lu_ret = lookupPTSlot(lvl1pt, vaddr);
 
     /* if there is already something mapped (valid is set) or we have traversed far enough
-     * that a page table is not valid to map then tell the user that they ahve to delete
+     * that a page table is not valid to map then tell the user that they have to delete
      * something before they can put a PT here */
     if (lu_ret.ptBitsLeft == seL4_PageBits || pte_ptr_get_valid(lu_ret.ptSlot)) {
         userError("RISCVPageTableMap: All objects mapped at this address");
@@ -752,10 +780,10 @@ static exception_t decodeRISCVPageTableInvocation(word_t label, word_t length,
                         PTE_PTR(cap_page_table_cap_get_capPTBasePtr(cap)));
     pte_t pte = pte_new((paddr >> seL4_PageBits),
                         0, /* sw */
-                        1, /* dirty */
-                        1, /* accessed */
+                        0, /* dirty (reserved non-leaf) */
+                        0, /* accessed (reserved non-leaf) */
                         0,  /* global */
-                        0,  /* user */
+                        0,  /* user (reserved non-leaf) */
                         0,  /* execute */
                         0,  /* write */
                         0,  /* read */
@@ -771,12 +799,11 @@ static exception_t decodeRISCVPageTableInvocation(word_t label, word_t length,
 }
 
 static exception_t decodeRISCVFrameInvocation(word_t label, word_t length,
-                                              cte_t *cte, cap_t cap, extra_caps_t extraCaps,
-                                              word_t *buffer)
+                                              cte_t *cte, cap_t cap, bool_t call, word_t *buffer)
 {
     switch (label) {
     case RISCVPageMap: {
-        if (unlikely(length < 3 || extraCaps.excaprefs[0] == NULL)) {
+        if (unlikely(length < 3 || current_extra_caps.excaprefs[0] == NULL)) {
             userError("RISCVPageMap: Truncated message.");
             current_syscall_error.type = seL4_TruncatedMessage;
             return EXCEPTION_SYSCALL_ERROR;
@@ -785,7 +812,7 @@ static exception_t decodeRISCVFrameInvocation(word_t label, word_t length,
         word_t vaddr = getSyscallArg(0, buffer);
         word_t w_rightsMask = getSyscallArg(1, buffer);
         vm_attributes_t attr = vmAttributesFromWord(getSyscallArg(2, buffer));
-        cap_t lvl1ptCap = extraCaps.excaprefs[0]->cap;
+        cap_t lvl1ptCap = current_extra_caps.excaprefs[0]->cap;
 
         vm_page_size_t frameSize = cap_frame_cap_get_capFSize(cap);
         vm_rights_t capVMRights = cap_frame_cap_get_capFVMRights(cap);
@@ -863,7 +890,7 @@ static exception_t decodeRISCVFrameInvocation(word_t label, word_t length,
         } else {
             /* check this vaddr isn't already mapped */
             if (unlikely(pte_ptr_get_valid(lu_ret.ptSlot))) {
-                userError("Virtual address already mapped");
+                userError("Virtual address (0x%"SEL4_PRIx_word") already mapped", vaddr);
                 current_syscall_error.type = seL4_DeleteFirst;
                 return EXCEPTION_SYSCALL_ERROR;
             }
@@ -891,7 +918,7 @@ static exception_t decodeRISCVFrameInvocation(word_t label, word_t length,
         assert(n_msgRegisters >= 1);
 
         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
-        return performPageGetAddress((void *)cap_frame_cap_get_capFBasePtr(cap));
+        return performPageGetAddress((void *)cap_frame_cap_get_capFBasePtr(cap), call);
     }
 
     default:
@@ -904,16 +931,15 @@ static exception_t decodeRISCVFrameInvocation(word_t label, word_t length,
 }
 
 exception_t decodeRISCVMMUInvocation(word_t label, word_t length, cptr_t cptr,
-                                     cte_t *cte, cap_t cap, extra_caps_t extraCaps,
-                                     word_t *buffer)
+                                     cte_t *cte, cap_t cap, bool_t call, word_t *buffer)
 {
     switch (cap_get_capType(cap)) {
 
     case cap_page_table_cap:
-        return decodeRISCVPageTableInvocation(label, length, cte, cap, extraCaps, buffer);
+        return decodeRISCVPageTableInvocation(label, length, cte, cap, buffer);
 
     case cap_frame_cap:
-        return decodeRISCVFrameInvocation(label, length, cte, cap, extraCaps, buffer);
+        return decodeRISCVFrameInvocation(label, length, cte, cap, call, buffer);
 
     case cap_asid_control_cap: {
         word_t     i;
@@ -934,23 +960,23 @@ exception_t decodeRISCVMMUInvocation(word_t label, word_t length, cptr_t cptr,
             return EXCEPTION_SYSCALL_ERROR;
         }
 
-        if (length < 2 || extraCaps.excaprefs[0] == NULL
-            || extraCaps.excaprefs[1] == NULL) {
+        if (length < 2 || current_extra_caps.excaprefs[0] == NULL
+            || current_extra_caps.excaprefs[1] == NULL) {
             current_syscall_error.type = seL4_TruncatedMessage;
             return EXCEPTION_SYSCALL_ERROR;
         }
 
         index = getSyscallArg(0, buffer);
         depth = getSyscallArg(1, buffer);
-        parentSlot = extraCaps.excaprefs[0];
+        parentSlot = current_extra_caps.excaprefs[0];
         untyped = parentSlot->cap;
-        root = extraCaps.excaprefs[1]->cap;
+        root = current_extra_caps.excaprefs[1]->cap;
 
         /* Find first free pool */
         for (i = 0; i < nASIDPools && riscvKSASIDTable[i]; i++);
 
         if (i == nASIDPools) {
-            /* no unallocated pool is found */
+            userError("ASIDControlMakePool: No unallocated pools found.");
             current_syscall_error.type = seL4_DeleteFirst;
 
             return EXCEPTION_SYSCALL_ERROR;
@@ -1001,13 +1027,13 @@ exception_t decodeRISCVMMUInvocation(word_t label, word_t length, cptr_t cptr,
 
             return EXCEPTION_SYSCALL_ERROR;
         }
-        if (extraCaps.excaprefs[0] == NULL) {
+        if (current_extra_caps.excaprefs[0] == NULL) {
             current_syscall_error.type = seL4_TruncatedMessage;
 
             return EXCEPTION_SYSCALL_ERROR;
         }
 
-        vspaceCapSlot = extraCaps.excaprefs[0];
+        vspaceCapSlot = current_extra_caps.excaprefs[0];
         vspaceCap = vspaceCapSlot->cap;
 
         if (unlikely(
@@ -1020,7 +1046,7 @@ exception_t decodeRISCVMMUInvocation(word_t label, word_t length, cptr_t cptr,
             return EXCEPTION_SYSCALL_ERROR;
         }
 
-        pool = riscvKSASIDTable[cap_asid_pool_cap_get_capASIDBase(cap) >> asidLowBits];
+        pool = riscvKSASIDTable[ASID_HIGH(cap_asid_pool_cap_get_capASIDBase(cap))];
         if (!pool) {
             current_syscall_error.type = seL4_FailedLookup;
             current_syscall_error.failedLookupWasSource = false;
@@ -1080,18 +1106,22 @@ exception_t performPageTableInvocationUnmap(cap_t cap, cte_t *ctSlot)
     return EXCEPTION_NONE;
 }
 
-static exception_t performPageGetAddress(void *vbase_ptr)
+static exception_t performPageGetAddress(void *vbase_ptr, bool_t call)
 {
-    paddr_t capFBasePtr;
-
     /* Get the physical address of this frame. */
+    paddr_t capFBasePtr;
     capFBasePtr = addrFromPPtr(vbase_ptr);
 
-    /* return it in the first message register */
-    setRegister(NODE_STATE(ksCurThread), msgRegisters[0], capFBasePtr);
-    setRegister(NODE_STATE(ksCurThread), msgInfoRegister,
-                wordFromMessageInfo(seL4_MessageInfo_new(0, 0, 0, 1)));
-
+    tcb_t *thread;
+    thread = NODE_STATE(ksCurThread);
+    if (call) {
+        word_t *ipcBuffer = lookupIPCBuffer(true, thread);
+        setRegister(thread, badgeRegister, 0);
+        unsigned int length = setMR(thread, ipcBuffer, 0, capFBasePtr);
+        setRegister(thread, msgInfoRegister, wordFromMessageInfo(
+                        seL4_MessageInfo_new(0, 0, 0, length)));
+    }
+    setThreadState(NODE_STATE(ksCurThread), ThreadState_Running);
     return EXCEPTION_NONE;
 }
 
@@ -1146,7 +1176,7 @@ void Arch_userStackTrace(tcb_t *tptr)
     for (int i = 0; i < CONFIG_USER_STACK_TRACE_LENGTH; i++) {
         word_t address = sp + (i * sizeof(word_t));
         lookupPTSlot_ret_t ret = lookupPTSlot(vspace_root, address);
-        if (pte_ptr_get_valid(ret.ptSlot) && !isPTEPageTable(ret.ptSlot)) {
+        if (address < USER_TOP && pte_ptr_get_valid(ret.ptSlot) && !isPTEPageTable(ret.ptSlot)) {
             pptr_t pptr = (pptr_t)(getPPtrFromHWPTE(ret.ptSlot));
             word_t *value = (word_t *)((word_t)pptr + (address & MASK(ret.ptBitsLeft)));
             printf("0x%lx: 0x%lx\n", (long) address, (long) *value);
@@ -1156,3 +1186,57 @@ void Arch_userStackTrace(tcb_t *tptr)
     }
 }
 #endif
+
+#ifdef CONFIG_KERNEL_LOG_BUFFER
+exception_t benchmark_arch_map_logBuffer(word_t frame_cptr)
+{
+    lookupCapAndSlot_ret_t lu_ret;
+    vm_page_size_t frameSize;
+    pptr_t  frame_pptr;
+
+    /* faulting section */
+    lu_ret = lookupCapAndSlot(NODE_STATE(ksCurThread), frame_cptr);
+
+    if (unlikely(lu_ret.status != EXCEPTION_NONE)) {
+        userError("Invalid cap #%lu.", frame_cptr);
+        current_fault = seL4_Fault_CapFault_new(frame_cptr, false);
+
+        return EXCEPTION_SYSCALL_ERROR;
+    }
+
+    if (cap_get_capType(lu_ret.cap) != cap_frame_cap) {
+        userError("Invalid cap. Log buffer should be of a frame cap");
+        current_fault = seL4_Fault_CapFault_new(frame_cptr, false);
+
+        return EXCEPTION_SYSCALL_ERROR;
+    }
+
+    frameSize = cap_frame_cap_get_capFSize(lu_ret.cap);
+
+    if (frameSize != RISCV_Mega_Page) {
+        userError("Invalid frame size. The kernel expects large page log buffer");
+        current_fault = seL4_Fault_CapFault_new(frame_cptr, false);
+
+        return EXCEPTION_SYSCALL_ERROR;
+    }
+
+    frame_pptr = cap_frame_cap_get_capFBasePtr(lu_ret.cap);
+
+    ksUserLogBuffer = pptr_to_paddr((void *) frame_pptr);
+
+#if __riscv_xlen == 32
+    paddr_t physical_address = ksUserLogBuffer;
+    for (word_t i = 0; i < BIT(PT_INDEX_BITS); i += 1) {
+        kernel_image_level1_log_buffer_pt[i] = pte_next(physical_address, true);
+        physical_address += BIT(PAGE_BITS);
+    }
+    assert(physical_address - ksUserLogBuffer == BIT(seL4_LargePageBits));
+#else
+    kernel_image_level1_dev_pt[RISCV_GET_PT_INDEX(KS_LOG_PPTR, 1)] = pte_next(ksUserLogBuffer, true);
+#endif
+
+    sfence();
+
+    return EXCEPTION_NONE;
+}
+#endif /* CONFIG_KERNEL_LOG_BUFFER */

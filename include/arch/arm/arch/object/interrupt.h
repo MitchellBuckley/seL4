@@ -13,8 +13,10 @@
 #include <plat/machine.h>
 
 exception_t Arch_decodeIRQControlInvocation(word_t invLabel, word_t length,
-                                            cte_t *srcSlot, extra_caps_t excaps,
-                                            word_t *buffer);
+                                            cte_t *srcSlot, word_t *buffer);
+
+exception_t decodeSGISignalInvocation(word_t invLabel, word_t length,
+                                      cap_t cap, word_t *buffer);
 
 /* Handle a platform-reserved IRQ. */
 static inline void handleReservedIRQ(irq_t irq)
@@ -39,7 +41,7 @@ static inline void handleReservedIRQ(irq_t irq)
     }
 #endif
 
-#ifdef CONFIG_ARM_SMMU
+#ifdef CONFIG_TK1_SMMU
     if (IRQT_TO_IRQ(irq) == INTERRUPT_SMMU) {
         plat_smmu_handle_interrupt();
         return;
@@ -58,7 +60,7 @@ static inline exception_t Arch_checkIRQ(word_t irq_w)
         current_syscall_error.type = seL4_RangeError;
         current_syscall_error.rangeErrorMin = 0;
         current_syscall_error.rangeErrorMax = maxIRQ;
-        userError("Rejecting request for IRQ %u. IRQ is greater than maxIRQ.", (int)irq_w);
+        userError("Rejecting request for IRQ %u. IRQ is out of range [0..%u].", (int)irq_w, maxIRQ);
         return EXCEPTION_SYSCALL_ERROR;
     }
     return EXCEPTION_NONE;

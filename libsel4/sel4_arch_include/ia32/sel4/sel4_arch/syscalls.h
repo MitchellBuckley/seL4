@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <autoconf.h>
+#include <sel4/config.h>
 #include <sel4/functions.h>
 #include <sel4/types.h>
 
@@ -144,7 +144,7 @@ static inline void x86_sys_send_recv(seL4_Word sys, seL4_Word dest, seL4_Word *o
         :
         "=S"(*out_info),
         "=D"(*in_out_mr1),
-        "=d"(*out_badge)
+        "=d"(*out_badge),
         MCS_COND("+c"(reply), "=c"(*in_out_mr2))
         : "a"(sys),
         "S"(info),
@@ -874,6 +874,21 @@ LIBSEL4_INLINE_FUNC void seL4_DebugNameThread(seL4_CPtr tcb, const char *name)
 
     x86_sys_send_recv(seL4_SysDebugNameThread, tcb, &unused0, 0, &unused1, &unused2, MCS_COND(0, &unused3));
 }
+
+#if CONFIG_ENABLE_SMP_SUPPORT
+LIBSEL4_INLINE_FUNC seL4_Word seL4_DebugGetThreadAffinity(seL4_CPtr tcb)
+{
+    seL4_Word unused0 = 0;
+    seL4_Word unused1 = 0;
+    LIBSEL4_UNUSED seL4_Word unused2 = 0;
+
+    seL4_Word affinity = 0;
+
+    x86_sys_send_recv(seL4_SysDebugGetThreadAffinity, tcb, &affinity, 0,
+                      &unused0, &unused1, MCS_COND(0, &unused2));
+    return affinity;
+}
+#endif /* CONFIG_ENABLE_SMP_SUPPORT */
 #endif
 
 #if defined(CONFIG_DANGEROUS_CODE_INJECTION)
@@ -903,7 +918,7 @@ LIBSEL4_INLINE_FUNC seL4_Uint64 seL4_X86DangerousRDMSR(seL4_Word msr)
     x86_sys_recv(seL4_SysX86DangerousRDMSR, msr, &unused0, &unused1, &low, MCS_COND(0, &high));
 #ifdef CONFIG_KERNEL_MCS
     /* MR1 doesn't get passed through MRs on CONFIG_KERNEL_MCS */
-    *high = seL4_GetMR(1);
+    high = seL4_GetMR(1);
 #endif
 
     return ((seL4_Uint64)low) | ((seL4_Uint64)high << 32);

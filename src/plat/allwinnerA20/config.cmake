@@ -4,8 +4,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 
-cmake_minimum_required(VERSION 3.7.2)
-
 declare_platform(allwinnerA20 KernelPlatformAllwinnerA20 PLAT_ALLWINNERA20 KernelSel4ArchAarch32)
 
 if(KernelPlatformAllwinnerA20)
@@ -14,18 +12,18 @@ if(KernelPlatformAllwinnerA20)
     set(KernelArchArmV7a ON)
     config_set(KernelARMPlatform ARM_PLAT allwinnerA20)
 
-    # MCS is not supported on allwinnerA20.
-    # It requires a timer driver that implements the tickless programming requirements.
+    # MCS is not supported on allwinnerA20. It requires a timer driver that
+    # implements the tickless programming requirements.
     set(KernelPlatformSupportsMCS OFF)
 
     list(APPEND KernelDTSList "tools/dts/allwinnerA20.dts")
     list(APPEND KernelDTSList "src/plat/allwinnerA20/overlay-allwinnerA20.dts")
 
     declare_default_headers(
-        TIMER_FREQUENCY 24000000llu
+        TIMER_FREQUENCY 24000000
         MAX_IRQ 122
         NUM_PPI 32
-        TIMER drivers/timer/allwinner.h
+        TIMER drivers/timer/arm_generic.h
         INTERRUPT_CONTROLLER arch/machine/gic_v2.h
     )
 endif()

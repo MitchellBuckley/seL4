@@ -6,7 +6,8 @@
 
 #pragma once
 
-#include <autoconf.h>
+#include <sel4/config.h>
+#include <sel4/macros.h>
 
 #define TLS_GDT_ENTRY   7
 #define TLS_GDT_SELECTOR ((TLS_GDT_ENTRY << 3) | 3)
@@ -52,7 +53,10 @@
 #define seL4_PML4IndexBits      9
 #define seL4_VSpaceBits seL4_PML4Bits
 
-#define seL4_IOPageTableBits    12
+#define seL4_IOPageTableBits      12
+#define seL4_IOPageTableIndexBits 9
+#define seL4_IOPageTableEntryBits 3
+
 #define seL4_LargePageBits      21
 #define seL4_HugePageBits       30
 #define seL4_NumASIDPoolsBits    3
@@ -70,6 +74,7 @@ SEL4_SIZE_SANITY(seL4_PageDirEntryBits, seL4_PageDirIndexBits, seL4_PageDirBits)
 SEL4_SIZE_SANITY(seL4_PDPTEntryBits, seL4_PDPTIndexBits, seL4_PDPTBits);
 SEL4_SIZE_SANITY(seL4_PML4EntryBits, seL4_PML4IndexBits, seL4_PML4Bits);
 SEL4_SIZE_SANITY(seL4_WordSizeBits, seL4_ASIDPoolIndexBits, seL4_ASIDPoolBits);
+SEL4_SIZE_SANITY(seL4_IOPageTableEntryBits, seL4_IOPageTableIndexBits, seL4_IOPageTableBits);
 
 typedef enum {
     seL4_VMFault_IP,
@@ -120,7 +125,7 @@ typedef enum {
     seL4_Timeout_Consumed,
     seL4_Timeout_Length,
     SEL4_FORCE_LONG_ENUM(seL4_Timeout_Msg)
-} seL4_TimeoutMsg;
+} seL4_Timeout_Msg;
 
 typedef enum {
     seL4_TimeoutReply_FaultIP,
@@ -152,6 +157,8 @@ typedef enum {
 /* IPC buffer is 1024 bytes, giving size bits of 10 */
 #define seL4_IPCBufferSizeBits 10
 
-/* First address in the virtual address space that is not accessible to user level */
+/* (Deprecated) First address in the virtual address space that is not accessible to user level */
 #define seL4_UserTop 0x00007ffffffff000
 
+/* Last address in the virtual address space that is accessible to user level */
+#define seL4_UserVSpaceTop (seL4_UserTop - 1)

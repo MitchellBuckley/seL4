@@ -6,19 +6,11 @@
 
 #pragma once
 
-#ifdef HAVE_AUTOCONF
-#include <autoconf.h>
-#endif
+#include <sel4/config.h>
+#include <sel4/arch/constants_cortex_a8.h>
 
-/* Cortex a8 manual, table 12-11 */
-#define seL4_NumHWBreakpoints (8)
-#define seL4_NumExclusiveBreakpoints (6)
-#define seL4_NumExclusiveWatchpoints (2)
-#ifdef CONFIG_HARDWARE_DEBUG_API
-#define seL4_FirstWatchpoint (6)
-#define seL4_NumDualFunctionMonitors (0)
-#endif
-
-/* First address in the virtual address space that is not accessible to user level */
+/* (Deprecated) First address in the virtual address space that is not accessible to user level */
 #define seL4_UserTop 0xf0000000
 
+/* Last address in the virtual address space that is accessible to user level */
+#define seL4_UserVSpaceTop (seL4_UserTop - 1)

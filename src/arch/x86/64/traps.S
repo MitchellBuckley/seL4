@@ -20,7 +20,7 @@
  * The RSP is aligned to a 16-byte boundary before pushing the stack frame.
  * In x86-64 mode, when stacks are switched as part of a 64-bit mode privilege-level
  * change, a new SS descriptor is not loaded. x86-64 mode loads only an inner-level
- * RSP from the TSS. The new SS selector is forced to NULL and the SS selctor's RPL
+ * RSP from the TSS. The new SS selector is forced to NULL and the SS selector's RPL
  * field is set to the new CPL. The old SS and RSP are saved on the new stack.
  *
  * Stack Usage with Privilege-Level Change
@@ -36,13 +36,13 @@
  * ES, DS and SS segment registers are not used in 64-bit mode, their
  * fields (base, limit and attribute) in segment descriptor registers
  * are ignored. Some forms of segment load instructions are also invalid.
- * Address caculations that reference the DS, ES or SS segments are treated
+ * Address calculations that reference the DS, ES or SS segments are treated
  * as if the segment base is zero. Mode change does not change the contents
  * of the segment registers or associated descriptor register. These registers
- * are also not changed during 64-bit mode exectuion, unless explicit
+ * are also not changed during 64-bit mode execution, unless explicit
  * segment loads are performed.
  *
- * In order to setup compability mode for an application, segment-load
+ * In order to setup compatibility mode for an application, segment-load
  * instructions (mov to Sreg, pop Sreg) work normally in 64-bit mode. An
  * entry is read from the system descriptor table (GDT or LDT) and is loaded
  * in the hidden portion of the segment descriptor. The descriptor-register
@@ -170,7 +170,7 @@ int_##number:                                       \
 #define INT_HANDLER_WITH_ERR_CODE(number,except) INT_HANDLER_COMMON(number,,except)
 #define INT_HANDLER_WITHOUT_ERR_CODE(number,except) INT_HANDLER_COMMON(number,pushq $0x0,except)
 
-.section .text
+.section .text, "ax"
 .code64
 
 INT_HANDLER_WITHOUT_ERR_CODE(00,1)
@@ -446,6 +446,12 @@ INT_HANDLER_WITHOUT_ERR_CODE(fe,0)
 INT_HANDLER_WITHOUT_ERR_CODE(ff,0)
 
 BEGIN_FUNC(handle_interrupt)
+    # The flags TF, NT, RF, VM, and IF are cleared automatically on IRQ entry.
+    # DF is not cleared on IRQ entry, and kernel code needs DF to be off.
+    # The AC flag (under SMAP) is not relevant for seL4, the kernel does not
+    # access user pages outside debug configs and SMAP is turned off on debug.
+    # User RFLAGS are already saved by CPU at this point.
+    cld
     # push the rest of the registers
     INT_SAVE_STATE
 
@@ -568,6 +574,11 @@ BEGIN_FUNC(kernel_exception)
     movq    24(%r8), %r8     # RFLAGS
     # handleKernelException(vector, errorcode, RIP, RSP, RFLAGS, CR0, CR2, CR3, CR4)
     movq    %cr0, %r9
+
+    # At this point the stack would be 16-bytes aligned, but we are only pushing 3x 8-byte
+    # values below, so we need to maintain stack alignment.
+    subq    $8, %rsp
+
     movq    %cr4, %r11
     push    %r11
     movq    %cr3, %r11
@@ -575,7 +586,7 @@ BEGIN_FUNC(kernel_exception)
     movq    %cr2, %r11
     push    %r11
     call    handleKernelException
-    addq    $24, %rsp
+    addq    $32, %rsp
     # Set RIP in the saved register context to the new IP returned from handleKernelException
     LOAD_IRQ_STACK(r8)
     movq    %rax, 8(%r8)
@@ -656,6 +667,12 @@ BEGIN_FUNC(handle_syscall)
     # switch to kernel stack
     LOAD_KERNEL_STACK
 
+    # After SYSENTER the user flags NT and DF (and AC) are still present.
+    # DF and NT can affect kernel integrity, so must be clear. The are already
+    # saved above for user return.
+    pushq   $0x2
+    popfq
+
     # RSI, RDI are already correct for calling c_handle_syscall
     movq %rax, %rdx
     # gtfo to C land, we will not return
@@ -670,7 +687,19 @@ END_FUNC(handle_syscall)
 # RSP points to the end of the VCPUs general purpose register array
 #ifdef CONFIG_VTX
 BEGIN_FUNC(handle_vmexit)
+#ifndef CONFIG_X86_64_VTX_64BIT_GUESTS
     MAYBE_SWAPGS
+#else
+    # Save the guest's gp registers
+    push    %r15
+    push    %r14
+    push    %r13
+    push    %r12
+    push    %r11
+    push    %r10
+    push    %r9
+    push    %r8
+#endif
     push    %rbp
     push    %rdi
     push    %rsi
@@ -678,6 +707,46 @@ BEGIN_FUNC(handle_vmexit)
     push    %rcx
     push    %rbx
     push    %rax
+
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    # Save the guest's GS, Shadow GS, and FS
+    mov $0xC0000100, %ecx
+    rdmsr
+    shl $0x20,%rdx
+    or %rdx, %rax
+    pushq %rax # Save FS
+    swapgs
+    mov $0xC0000101, %ecx
+    rdmsr
+    shl $0x20,%rdx
+    or %rdx, %rax
+    pushq %rax # Save Shadow GS
+    swapgs
+    rdmsr
+    shl $0x20,%rdx
+    or %rdx, %rax
+    pushq %rax # Save GS
+
+    # RSP now at host_gs registers
+    sub $0x18, %rsp
+
+    # Restore the host's GS and Shadow GS
+    pop %rax
+    movq %rax, %rdx
+    shr $0x20, %rdx
+    wrmsr # GS
+    swapgs
+    pop %rax
+    movq %rax, %rdx
+    shr $0x20, %rdx
+    wrmsr # Shadow GS
+    swapgs
+    mov $0xC0000100, %ecx
+    pop %rax
+    movq %rax, %rdx
+    shr $0x20, %rdx
+    wrmsr # FS
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
 
     # switch to kernel stack
     LOAD_KERNEL_STACK

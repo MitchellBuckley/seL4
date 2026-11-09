@@ -23,23 +23,52 @@
 
 #include "gic_common.h"
 
+/**
+ * Per §4.8 of ARM GICv3/v4 Spec (IHI0069 Hb):
+ *  - higher numbers are lower priorities
+ *  - the GIC must support at least priority bits [7:4], i.e 0x00-0xF0 in steps of 16.
+ **/
 #define GIC_PRI_LOWEST     0xf0
 #define GIC_PRI_IRQ        0xa0
 #define GIC_PRI_HIGHEST    0x80 /* Higher priorities belong to Secure-World */
 
 #define IRQ_MASK MASK(16u)
+#define GIC_VCPU_MAX_NUM_LR 16
 
 /* Register bits */
-#define GICD_CTL_ENABLE 0x1
+
+/**
+ * The GICD_CTLR distributor control register (per IHI0069 Hb) has various
+ * layouts depending on the security state configuration. seL4 assumes that we
+ * are in:
+ *
+ *   - "access is Non-secure, in a system that supports two Security states", or
+ *   - "When in a system that supports only a single Security state".
+ *
+ * and not "When access is Secure, in a system that supports two Security
+ * states". In both these cases GICD_CTLR_ARE_NS is bit 4, RWP is bit 31, and,
+ * with ARE_NS set, bit 1 always enables Non-secure Group 1 interrupts.
+ *
+ * Bit 0 changes: In a single Security state system it is EnableGrp0. With
+ * Non-secure access it is EnableGrp1 when ARE_NS is clear and RES0 when ARE_NS
+ * is set. seL4 does not set bit 0 in either case and only uses Group 1.
+ */
 #define GICD_CTLR_RWP                BIT(31)
 #define GICD_CTLR_ARE_NS             BIT(4)
-#define GICD_CTLR_ENABLE_G1NS         BIT(1)
-#define GICD_CTLR_ENABLE_G0          BIT(0)
+#define GICD_CTLR_ENABLE_G1NS        BIT(1)
+
 #define GICD_IROUTER_SPI_MODE_ANY    BIT(31)
 
 #define GICD_TYPE_LINESNR 0x01f
 
 #define GICC_SRE_EL1_SRE             BIT(0)
+#define GICC_SRE_EL1_DFB             BIT(1)
+#define GICC_SRE_EL1_DIB             BIT(2)
+
+#define GICC_SRE_EL2_SRE             BIT(0)
+#define GICC_SRE_EL2_DFB             BIT(1)
+#define GICC_SRE_EL2_DIB             BIT(2)
+#define GICC_SRE_EL2_EN              BIT(3)
 
 #define GICR_WAKER_ProcessorSleep    BIT(1)
 #define GICR_WAKER_ChildrenAsleep    BIT(2)
@@ -59,7 +88,39 @@
 #define ICC_CTLR_EL1    "S3_0_C12_C12_4"
 #define ICC_IGRPEN1_EL1 "S3_0_C12_C12_7"
 #define ICC_SRE_EL1     "S3_0_C12_C12_5"
+#define ICC_SRE_EL2     "S3_4_C12_C9_5"
 #define MPIDR           "mpidr_el1"
+/* Virt control registers */
+#define ICH_AP0R0_EL2   "S3_4_C12_C8_0"
+#define ICH_AP0R1_EL2   "S3_4_C12_C8_1"
+#define ICH_AP0R2_EL2   "S3_4_C12_C8_2"
+#define ICH_AP0R3_EL2   "S3_4_C12_C8_3"
+#define ICH_AP1R0_EL2   "S3_4_C12_C9_0"
+#define ICH_AP1R1_EL2   "S3_4_C12_C9_1"
+#define ICH_AP1R2_EL2   "S3_4_C12_C9_2"
+#define ICH_AP1R3_EL2   "S3_4_C12_C9_3"
+#define ICH_HCR_EL2     "S3_4_C12_C11_0"
+#define ICH_VTR_EL2     "S3_4_C12_C11_1"
+#define ICH_MISR_EL2    "S3_4_C12_C11_2"
+#define ICH_EISR_EL2    "S3_4_C12_C11_3"
+#define ICH_ELRSR_EL2   "S3_4_C12_C11_5"
+#define ICH_VMCR_EL2    "S3_4_C12_C11_7"
+#define ICH_LR0_EL2     "S3_4_C12_C12_0"
+#define ICH_LR1_EL2     "S3_4_C12_C12_1"
+#define ICH_LR2_EL2     "S3_4_C12_C12_2"
+#define ICH_LR3_EL2     "S3_4_C12_C12_3"
+#define ICH_LR4_EL2     "S3_4_C12_C12_4"
+#define ICH_LR5_EL2     "S3_4_C12_C12_5"
+#define ICH_LR6_EL2     "S3_4_C12_C12_6"
+#define ICH_LR7_EL2     "S3_4_C12_C12_7"
+#define ICH_LR8_EL2     "S3_4_C12_C13_0"
+#define ICH_LR9_EL2     "S3_4_C12_C13_1"
+#define ICH_LR10_EL2    "S3_4_C12_C13_2"
+#define ICH_LR11_EL2    "S3_4_C12_C13_3"
+#define ICH_LR12_EL2    "S3_4_C12_C13_4"
+#define ICH_LR13_EL2    "S3_4_C12_C13_5"
+#define ICH_LR14_EL2    "S3_4_C12_C13_6"
+#define ICH_LR15_EL2    "S3_4_C12_C13_7"
 #else
 #define ICC_IAR1_EL1    " p15, 0,  %0, c12,  c12, 0"
 #define ICC_EOIR1_EL1   " p15, 0,  %0, c12,  c12, 1"
@@ -70,8 +131,35 @@
 #define ICC_CTLR_EL1    " p15, 0,  %0, c12,  c12, 4"
 #define ICC_IGRPEN1_EL1 " p15, 0,  %0, c12,  c12, 7"
 #define ICC_SRE_EL1     " p15, 0,  %0, c12,  c12, 5"
+#define ICC_SRE_EL2     " p15, 4,  %0, c12,  c9, 5"
 #define MPIDR           " p15, 0,  %0, c0,  c0, 5"
+
+/* Note: Virtualization control registers not currently defined for AARCH32 */
+
 #endif
+
+/* Helpers for VGIC */
+#define VGIC_HCR_EOI_INVALID_COUNT(hcr) (((hcr) >> 27) & 0x1f)
+#define VGIC_HCR_TALL0                  (1U << 11)
+#define VGIC_HCR_VGRP1DIE               (1U << 7)
+#define VGIC_HCR_VGRP1EIE               (1U << 6)
+#define VGIC_HCR_VGRP0DIE               (1U << 5)
+#define VGIC_HCR_VGRP0EIE               (1U << 4)
+#define VGIC_HCR_NPIE                   (1U << 3)
+#define VGIC_HCR_LRENPIE                (1U << 2)
+#define VGIC_HCR_UIE                    (1U << 1)
+#define VGIC_HCR_EN                     (1U << 0)
+#define VGIC_MISR_VGRP1D                VGIC_HCR_VGRP1DIE
+#define VGIC_MISR_VGRP1E                VGIC_HCR_VGRP1EIE
+#define VGIC_MISR_VGRP0D                VGIC_HCR_VGRP0DIE
+#define VGIC_MISR_VGRP0E                VGIC_HCR_VGRP0EIE
+#define VGIC_MISR_NP                    VGIC_HCR_NPIE
+#define VGIC_MISR_LRENP                 VGIC_HCR_LRENPIE
+#define VGIC_MISR_U                     VGIC_HCR_UIE
+#define VGIC_MISR_EOI                   VGIC_HCR_EN
+#define VGIC_VTR_NLISTREGS(vtr)         ((((vtr) >>  0) & 0x3f) + 1)
+#define VGIC_VTR_NPRIOBITS(vtr)         ((((vtr) >> 29) & 0x07) + 1)
+#define VGIC_VTR_NPREBITS(vtr)          ((((vtr) >> 26) & 0x07) + 1)
 
 /* Memory map for GIC distributor */
 struct gic_dist_map {
@@ -111,10 +199,18 @@ struct gic_dist_map {
     uint32_t res8[3];               /* [0xF04, 0xF10) */
     uint32_t cpendsgirn[4];         /* [0xF10, 0xF20) */
     uint32_t spendsgirn[4];         /* [0xF20, 0xF30) */
-    uint32_t res9[5235];            /* [0x0F30, 0x6100) */
+    uint32_t res9[5236];            /* [0x0F30, 0x6100) */
 
-    uint64_t iroutern[960];         /* [0x6100, 0x7F00) */
+    uint64_t iroutern[960];         /* [0x6100, 0x7F00) irouter<n> to configure IRQs
+                                     * with INTID from 32 to 1019. iroutern[0] is the
+                                     * interrupt routing for SPI 32 */
 };
+
+/* __builtin_offsetof is not in the verification C subset, so we can only check this in
+   non-verification builds. We specifically do not declare a macro for the builtin, because
+   we do not want break the verification subset by accident. */
+unverified_compile_assert(error_in_gic_dist_map,
+                          0x6100 == __builtin_offsetof(struct gic_dist_map, iroutern));
 
 /* Memory map for GIC Redistributor Registers for control and physical LPI's */
 struct gic_rdist_map {          /* Starting */
@@ -169,37 +265,6 @@ extern volatile struct gic_rdist_map *gic_rdist_map[CONFIG_MAX_NUM_NODES];
 extern volatile struct gic_rdist_sgi_ppi_map *gic_rdist_sgi_ppi_map[CONFIG_MAX_NUM_NODES];
 
 /* Helpers */
-static inline int is_irq_edge_triggered(word_t irq)
-{
-    uint32_t icfgr = 0;
-    int word = irq >> 4;
-    int bit = ((irq & 0xf) * 2);
-
-    if (HW_IRQ_IS_SGI(irq)) {
-        return 0;
-    }
-    if (HW_IRQ_IS_PPI(irq)) {
-        icfgr = gic_rdist_sgi_ppi_map[CURRENT_CPU_INDEX()]->icfgr1;
-    } else {
-        icfgr = gic_dist->icfgrn[word];
-    }
-
-    return !!(icfgr & BIT(bit + 1));
-}
-
-static inline void gic_pending_clr(word_t irq)
-{
-    int word = IRQ_REG(irq);
-    int bit = IRQ_BIT(irq);
-    /* Using |= here is detrimental to your health */
-    /* Applicable for SPI and PPIs */
-    if (irq < SPI_START) {
-        gic_rdist_sgi_ppi_map[CURRENT_CPU_INDEX()]->icpendr0 = BIT(bit);
-    } else {
-        gic_dist->icpendrn[word] = BIT(bit);
-    }
-}
-
 static inline void gic_enable_clr(word_t irq)
 {
     int word = IRQ_REG(irq);
@@ -231,7 +296,7 @@ static inline irq_t getActiveIRQ(void)
     irq_t irq;
 
     if (!IS_IRQ_VALID(active_irq[CURRENT_CPU_INDEX()])) {
-        uint32_t val = 0;
+        word_t val = 0;
         SYSTEM_READ_WORD(ICC_IAR1_EL1, val);
         active_irq[CURRENT_CPU_INDEX()] = val;
     }
@@ -250,9 +315,11 @@ static inline irq_t getActiveIRQ(void)
  * seL4 expects two states: active->inactive.
  * We ignore the active state in GIC to conform
  */
+/** MODIFIES: phantom_machine_state */
+/** DONT_TRANSLATE */
 static inline bool_t isIRQPending(void)
 {
-    uint32_t val = 0;
+    word_t val = 0;
     /* Check for pending IRQs in group 1: ICC_HPPIR1_EL1 */
     SYSTEM_READ_WORD(ICC_HPPIR1_EL1, val);
     return IS_IRQ_VALID(val);
@@ -271,18 +338,233 @@ static inline void maskInterrupt(bool_t disable, irq_t irq)
     }
 }
 
-static inline void ackInterrupt(irq_t irq)
+
+static inline void deactivateInterrupt(irq_t irq)
 {
     word_t hw_irq = IRQT_TO_IRQ(irq);
-    assert(IS_IRQ_VALID(active_irq[CURRENT_CPU_INDEX()]) && (active_irq[CURRENT_CPU_INDEX()] & IRQ_MASK) == hw_irq);
+    /* Perform deactivation of hw_irq */
+    SYSTEM_WRITE_WORD(ICC_DIR_EL1, hw_irq);
+}
 
-    if (is_irq_edge_triggered(hw_irq)) {
-        gic_pending_clr(hw_irq);
-    }
+static inline void ackInterrupt(irq_t irq)
+{
+    assert(IS_IRQ_VALID(active_irq[CURRENT_CPU_INDEX()])
+           && (active_irq[CURRENT_CPU_INDEX()] & IRQ_MASK) == IRQT_TO_IRQ(irq));
+    active_irq[CURRENT_CPU_INDEX()] = IRQ_NONE;
+
+    word_t hw_irq = IRQT_TO_IRQ(irq);
 
     /* Set End of Interrupt for active IRQ: ICC_EOIR1_EL1 */
-    SYSTEM_WRITE_WORD(ICC_EOIR1_EL1, active_irq[CURRENT_CPU_INDEX()]);
-    active_irq[CURRENT_CPU_INDEX()] = IRQ_NONE;
+    /* Perform priority drop for current IRQ */
+    SYSTEM_WRITE_WORD(ICC_EOIR1_EL1, hw_irq);
+
+    // If the IRQ is not going to user level then we need to deactivate it too.
+    if (unlikely(hw_irq > maxIRQ) ||
+        intStateIRQTable[IRQT_TO_IDX(irq)] != IRQSignal) {
+        /* There needs to be an isb() to ensure completion of the system
+         * register write in ackInterrupt
+         */
+        isb();
+        deactivateInterrupt(irq);
+    }
 
 }
 
+#ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
+
+extern word_t gic_vcpu_num_list_regs;
+
+static inline uint32_t get_gic_vcpu_ctrl_hcr(void)
+{
+    uint64_t reg;
+    MRS(ICH_HCR_EL2, reg);
+    /* 64 bit register read, top 32 bits reserved */
+    return (uint32_t) reg;
+}
+
+static inline void set_gic_vcpu_ctrl_hcr(uint32_t hcr)
+{
+    MSR(ICH_HCR_EL2, hcr);
+}
+
+static inline uint32_t get_gic_vcpu_ctrl_vmcr(void)
+{
+    uint64_t reg;
+    MRS(ICH_VMCR_EL2, reg);
+    /* 64 bit register read, top 32 bits reserved */
+    return (uint32_t) reg;
+}
+
+static inline void set_gic_vcpu_ctrl_vmcr(uint32_t vmcr)
+{
+    MSR(ICH_VMCR_EL2, vmcr);
+}
+
+/* Note: On the GICv3 there are potentially up to 128 preemption
+ * levels, and as such up to 4 APR registers.
+ *
+ * At this point the code assumes a maximum of 32 preemption levels.
+ */
+static inline uint32_t get_gic_vcpu_ctrl_apr(void)
+{
+    uint64_t reg;
+    MRS(ICH_AP1R0_EL2, reg);
+    /* 64 bit register read, top 32 bits reserved */
+    return (uint32_t) reg;
+}
+
+static inline void set_gic_vcpu_ctrl_apr(uint32_t apr)
+{
+    MSR(ICH_AP1R0_EL2, apr);
+}
+
+static inline uint32_t get_gic_vcpu_ctrl_vtr(void)
+{
+    uint64_t reg;
+    MRS(ICH_VTR_EL2, reg);
+    /* 64 bit register read, top 32 bits reserved */
+    return (uint32_t) reg;
+}
+
+static inline uint32_t get_gic_vcpu_ctrl_eisr0(void)
+{
+    uint64_t reg;
+    MRS(ICH_EISR_EL2, reg);
+    /* 64 bit register read, top 32 bits reserved */
+    return reg;
+}
+
+/* Note: GICv3 supports a maximum of 16 list registers
+ * so there is no need to support EISR1 on GICv3.
+ */
+static inline uint32_t get_gic_vcpu_ctrl_eisr1(void)
+{
+    return 0;
+}
+
+static inline uint32_t get_gic_vcpu_ctrl_misr(void)
+{
+    uint64_t reg;
+    MRS(ICH_MISR_EL2, reg);
+    /* 64 bit register read, top 32 bits reserved */
+    return (uint32_t) reg;
+}
+
+static inline virq_t get_gic_vcpu_ctrl_lr(int num)
+{
+    virq_t virq;
+    uint64_t reg = 0;
+    switch (num) {
+    case 0:
+        MRS(ICH_LR0_EL2, reg);
+        break;
+    case 1:
+        MRS(ICH_LR1_EL2, reg);
+        break;
+    case 2:
+        MRS(ICH_LR2_EL2, reg);
+        break;
+    case 3:
+        MRS(ICH_LR3_EL2, reg);
+        break;
+    case 4:
+        MRS(ICH_LR4_EL2, reg);
+        break;
+    case 5:
+        MRS(ICH_LR5_EL2, reg);
+        break;
+    case 6:
+        MRS(ICH_LR6_EL2, reg);
+        break;
+    case 7:
+        MRS(ICH_LR7_EL2, reg);
+        break;
+    case 8:
+        MRS(ICH_LR8_EL2, reg);
+        break;
+    case 9:
+        MRS(ICH_LR9_EL2, reg);
+        break;
+    case 10:
+        MRS(ICH_LR10_EL2, reg);
+        break;
+    case 11:
+        MRS(ICH_LR11_EL2, reg);
+        break;
+    case 12:
+        MRS(ICH_LR12_EL2, reg);
+        break;
+    case 13:
+        MRS(ICH_LR13_EL2, reg);
+        break;
+    case 14:
+        MRS(ICH_LR14_EL2, reg);
+        break;
+    case 15:
+        MRS(ICH_LR15_EL2, reg);
+        break;
+    default:
+        fail("gicv3: invalid lr");
+    }
+    virq.words[0] = reg;
+    return virq;
+}
+
+static inline void set_gic_vcpu_ctrl_lr(int num, virq_t lr)
+{
+    uint64_t reg = lr.words[0];
+    switch (num) {
+    case 0:
+        MSR(ICH_LR0_EL2, reg);
+        break;
+    case 1:
+        MSR(ICH_LR1_EL2, reg);
+        break;
+    case 2:
+        MSR(ICH_LR2_EL2, reg);
+        break;
+    case 3:
+        MSR(ICH_LR3_EL2, reg);
+        break;
+    case 4:
+        MSR(ICH_LR4_EL2, reg);
+        break;
+    case 5:
+        MSR(ICH_LR5_EL2, reg);
+        break;
+    case 6:
+        MSR(ICH_LR6_EL2, reg);
+        break;
+    case 7:
+        MSR(ICH_LR7_EL2, reg);
+        break;
+    case 8:
+        MSR(ICH_LR8_EL2, reg);
+        break;
+    case 9:
+        MSR(ICH_LR9_EL2, reg);
+        break;
+    case 10:
+        MSR(ICH_LR10_EL2, reg);
+        break;
+    case 11:
+        MSR(ICH_LR11_EL2, reg);
+        break;
+    case 12:
+        MSR(ICH_LR12_EL2, reg);
+        break;
+    case 13:
+        MSR(ICH_LR13_EL2, reg);
+        break;
+    case 14:
+        MSR(ICH_LR14_EL2, reg);
+        break;
+    case 15:
+        MSR(ICH_LR15_EL2, reg);
+        break;
+    default:
+        fail("gicv3: invalid lr");
+    }
+}
+
+#endif /* End of CONFIG_ARM_HYPERVISOR_SUPPORT */

@@ -44,13 +44,13 @@ static exception_t performSetEPTRoot(tcb_t *tcb, cap_t cap, cte_t *slot)
     return EXCEPTION_NONE;
 }
 
-exception_t decodeSetEPTRoot(cap_t cap, extra_caps_t excaps)
+exception_t decodeSetEPTRoot(cap_t cap)
 {
     cap_t rootCap;
     cte_t *rootSlot;
     deriveCap_ret_t dc_ret;
 
-    rootSlot = excaps.excaprefs[0];
+    rootSlot = current_extra_caps.excaprefs[0];
 
     if (rootSlot == NULL) {
         userError("TCB SetEPTRoot: Truncated message.");
@@ -80,17 +80,3 @@ exception_t decodeSetEPTRoot(cap_t cap, extra_caps_t excaps)
     return performSetEPTRoot(TCB_PTR(cap_thread_cap_get_capTCBPtr(cap)), dc_ret.cap, rootSlot);
 }
 #endif
-
-#ifdef ENABLE_SMP_SUPPORT
-void Arch_migrateTCB(tcb_t *thread)
-{
-#ifdef CONFIG_KERNEL_MCS
-    assert(thread->tcbSchedContext != NULL);
-#endif
-
-    /* check if thread own its current core FPU */
-    if (nativeThreadUsingFPU(thread)) {
-        switchFpuOwner(NULL, thread->tcbAffinity);
-    }
-}
-#endif /* ENABLE_SMP_SUPPORT */

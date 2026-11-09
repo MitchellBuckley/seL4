@@ -22,14 +22,16 @@ NODE_STATE_BEGIN(archNodeState)
 NODE_STATE_DECLARE(word_t, ipiReschedulePending);
 NODE_STATE_END(archNodeState);
 
-extern asid_pool_t *riscvKSASIDTable[BIT(asidHighBits)];
+extern asid_pool_t *riscvKSASIDTable[nASIDPools];
 
 /* Kernel Page Tables */
 extern pte_t kernel_root_pageTable[BIT(PT_INDEX_BITS)] VISIBLE;
 
-/* We need to introduce a level2 pagetable in order to map the BBL to a separate
- * page entry to avoid PMP exception. */
+/* We need to introduce a level 1 page table in order to map OpenSBI into
+   a separate 2MiB page to avoid a PMP exception */
 #if __riscv_xlen != 32
-extern pte_t kernel_image_level2_pt[BIT(PT_INDEX_BITS)];
+extern pte_t kernel_image_level1_pt[BIT(PT_INDEX_BITS)];
+extern pte_t kernel_image_level1_dev_pt[BIT(PT_INDEX_BITS)];
+#elif defined(CONFIG_KERNEL_LOG_BUFFER)
+extern pte_t kernel_image_level1_log_buffer_pt[BIT(PT_INDEX_BITS)];
 #endif
-

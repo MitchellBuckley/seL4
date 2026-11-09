@@ -6,16 +6,10 @@
 
 #pragma once
 
-#ifdef HAVE_AUTOCONF
-#include <autoconf.h>
-#endif
+#include <sel4/config.h>
+#include <sel4/macros.h>
 
 #ifndef __ASSEMBLER__
-#ifdef CONFIG_KERNEL_GLOBALS_FRAME
-enum {
-    seL4_GlobalsFrame = 0xffffc000,
-};
-#endif /* CONFIG_KERNEL_GLOBALS_FRAME */
 
 /* format of an unknown syscall message */
 typedef enum {
@@ -59,7 +53,6 @@ typedef enum {
     SEL4_FORCE_LONG_ENUM(seL4_VMFault_Msg),
 } seL4_VMFault_Msg;
 
-#ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
 typedef enum {
     seL4_VGICMaintenance_IDX,
     seL4_VGICMaintenance_Length,
@@ -68,6 +61,7 @@ typedef enum {
 
 typedef enum {
     seL4_VPPIEvent_IRQ,
+    seL4_VPPIEvent_Length,
     SEL4_FORCE_LONG_ENUM(seL4_VPPIEvent_Msg),
 } seL4_VPPIEvent_Msg;
 
@@ -79,8 +73,8 @@ typedef enum {
 
 typedef enum {
     seL4_VCPUReg_SCTLR = 0,
-    seL4_VCPUReg_ACTLR,
-    seL4_VCPUReg_TTBCR,
+    seL4_VCPURegSaveRange_start, /* begin vcpu save/restore reg range */
+    seL4_VCPUReg_TTBCR = seL4_VCPURegSaveRange_start,
     seL4_VCPUReg_TTBR0,
     seL4_VCPUReg_TTBR1,
     seL4_VCPUReg_DACR,
@@ -94,7 +88,6 @@ typedef enum {
     seL4_VCPUReg_NMRR,
     seL4_VCPUReg_CIDR,
     seL4_VCPUReg_TPIDRPRW,
-    seL4_VCPUReg_FPEXC,
     seL4_VCPUReg_LRsvc,
     seL4_VCPUReg_SPsvc,
     seL4_VCPUReg_LRabt,
@@ -110,22 +103,30 @@ typedef enum {
     seL4_VCPUReg_R10fiq,
     seL4_VCPUReg_R11fiq,
     seL4_VCPUReg_R12fiq,
-#if  CONFIG_MAX_NUM_NODES > 1
     seL4_VCPUReg_VMPIDR,
-#endif /* CONFIG_MAX_NUM_NODES > 1 */
     seL4_VCPUReg_SPSRsvc,
     seL4_VCPUReg_SPSRabt,
     seL4_VCPUReg_SPSRund,
     seL4_VCPUReg_SPSRirq,
     seL4_VCPUReg_SPSRfiq,
+    seL4_VCPUReg_PARhigh,
+    seL4_VCPUReg_PARlow,
+    seL4_VCPUReg_TTBR0high,
+    seL4_VCPUReg_TTBR1high,
+    seL4_VCPUReg_CSSELR,
+    seL4_VCPUReg_VDISR,
+    seL4_VCPURegSaveRange_end = seL4_VCPUReg_VDISR, /* end vcpu save/restore reg range */
     seL4_VCPUReg_CNTV_CTL,
     seL4_VCPUReg_CNTV_CVALhigh,
     seL4_VCPUReg_CNTV_CVALlow,
     seL4_VCPUReg_CNTVOFFhigh,
     seL4_VCPUReg_CNTVOFFlow,
+    seL4_VCPUReg_CNTKCTL,
+    seL4_VCPUReg_CPACR,
+    seL4_VCPUReg_FPEXC,
     seL4_VCPUReg_Num,
+    SEL4_FORCE_LONG_ENUM(seL4_VCPUReg),
 } seL4_VCPUReg;
-#endif /* CONFIG_ARM_HYPERVISOR_SUPPORT */
 
 #ifdef CONFIG_KERNEL_MCS
 typedef enum {
@@ -135,7 +136,7 @@ typedef enum {
     seL4_Timeout_Consumed_LowBits,
     seL4_Timeout_Length,
     SEL4_FORCE_LONG_ENUM(seL4_Timeout_Msg)
-} seL4_TimeoutMsg;
+} seL4_Timeout_Msg;
 
 typedef enum {
     seL4_TimeoutReply_FaultIP,
@@ -168,18 +169,9 @@ typedef enum {
 #define seL4_LargePageBits 16
 #define seL4_SlotBits 4
 
-#if ( \
-    defined(CONFIG_HAVE_FPU) && ( \
-        (defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(CONFIG_ARM_HYP_ENABLE_VCPU_CP14_SAVE_AND_RESTORE)) || \
-        defined(CONFIG_HARDWARE_DEBUG_API) \
-    ) \
-)
+#if defined(CONFIG_HAVE_FPU) && defined(CONFIG_HARDWARE_DEBUG_API)
 #define seL4_TCBBits 11
-#elif ( \
-    defined(CONFIG_HAVE_FPU) || \
-    (defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(CONFIG_ARM_HYP_ENABLE_VCPU_CP14_SAVE_AND_RESTORE)) || \
-    defined(CONFIG_HARDWARE_DEBUG_API) \
-)
+#elif defined(CONFIG_HAVE_FPU) || defined(CONFIG_HARDWARE_DEBUG_API)
 #define seL4_TCBBits 10
 #else
 #define seL4_TCBBits 9
@@ -215,7 +207,7 @@ typedef enum {
 #define seL4_PageDirBits 14
 #define seL4_VSpaceBits seL4_PageDirBits
 
-#ifdef CONFIG_ARM_SMMU
+#ifdef CONFIG_TK1_SMMU
 #define seL4_NumASIDPoolsBits 6
 #else
 #define seL4_NumASIDPoolsBits 7
@@ -248,14 +240,7 @@ SEL4_SIZE_SANITY(seL4_PGDEntryBits, seL4_PGDIndexBits, seL4_PGDBits);
 #define seL4_LogBufferSize (LIBSEL4_BIT(20))
 #endif /* CONFIG_ENABLE_BENCHMARKS */
 
-#ifdef CONFIG_HARDWARE_DEBUG_API
-#define seL4_FirstBreakpoint (0)
-#define seL4_FirstDualFunctionMonitor (-1)
-#define seL4_NumDualFunctionMonitors (0)
-#endif
-
 #define seL4_FastMessageRegisters 4
 
 /* IPC buffer is 512 bytes, giving size bits of 9 */
 #define seL4_IPCBufferSizeBits 9
-

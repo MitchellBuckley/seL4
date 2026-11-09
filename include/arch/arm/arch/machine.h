@@ -13,20 +13,17 @@
 
 #ifndef __ASSEMBLER__
 
-int get_num_avail_p_regs(void);
-const p_region_t *get_avail_p_regs(void);
-int get_num_dev_p_regs(void);
-p_region_t get_dev_p_reg(word_t i);
 void map_kernel_devices(void);
 
 void initL2Cache(void);
 
 void initIRQController(void);
 void cpu_initLocalIRQController(void);
-void setIRQTrigger(irq_t irq, bool_t trigger);
 #ifdef ENABLE_SMP_SUPPORT
 void setIRQTarget(irq_t irq, seL4_Word target);
 #endif
+bool_t plat_SGITargetValid(word_t target);
+void plat_sendSGI(word_t irq, word_t target);
 
 static inline void plat_cleanL2Range(paddr_t start, paddr_t end);
 static inline void plat_invalidateL2Range(paddr_t start, paddr_t end);
@@ -46,18 +43,26 @@ void cleanInvalidate_L1D(void);
 void cleanCaches_PoU(void);
 void cleanInvalidateL1Caches(void);
 
-/* Cleaning memory before user-level access */
+/* L1 instruction cache policy field of CTR/CTR_EL0 */
+#define CTR_L1IP(ctr)     (((ctr) >> 14) & MASK(2))
+#define CTR_L1IP_PIPT     3
+
+static inline bool_t isICachePIPT(void)
+{
+    return CTR_L1IP(readCTR()) == CTR_L1IP_PIPT;
+}
+
+/* Cleaning memory before user-level access. Does not flush cache. */
 static inline void clearMemory(word_t *ptr, word_t bits)
 {
     memzero(ptr, BIT(bits));
-    cleanCacheRange_PoU((word_t)ptr, (word_t)ptr + BIT(bits) - 1,
-                        addrFromPPtr(ptr));
 }
 
-static inline void clearMemoryRAM(word_t *ptr, word_t bits)
+/* Cleaning memory before page table walker access */
+static inline void clearMemory_PT(word_t *ptr, word_t bits)
 {
     memzero(ptr, BIT(bits));
-    cleanCacheRange_RAM((word_t)ptr, (word_t)ptr + BIT(bits) - 1,
+    cleanCacheRange_PoU((word_t)ptr, (word_t)ptr + BIT(bits) - 1,
                         addrFromPPtr(ptr));
 }
 
@@ -68,11 +73,7 @@ static inline void arch_pause(void)
 }
 #endif /* ENABLE_SMP_SUPPORT */
 
-static inline void Arch_finaliseInterrupt(void)
-{
-}
-
-/* Update the value of the actual regsiter to hold the expected value */
+/* Update the value of the actual register to hold the expected value */
 static inline exception_t Arch_setTLSRegister(word_t tls_base)
 {
     /* This register is saved and restored on kernel exit and entry so
@@ -82,4 +83,3 @@ static inline exception_t Arch_setTLSRegister(word_t tls_base)
 }
 
 #endif /* __ASSEMBLER__ */
-

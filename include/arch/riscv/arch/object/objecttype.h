@@ -11,6 +11,7 @@
 #include <api/types.h>
 #include <object/structures.h>
 #include <object/cnode.h>
+#include <arch/machine.h>
 
 deriveCap_ret_t Arch_deriveCap(cte_t *slot, cap_t cap);
 cap_t CONST Arch_updateCapData(bool_t preserve, word_t data, cap_t cap);
@@ -21,7 +22,7 @@ bool_t CONST Arch_sameObjectAs(cap_t cap_a, cap_t cap_b);
 cap_t Arch_createObject(object_t t, void *regionBase, word_t userSize, bool_t deviceMemory);
 exception_t Arch_decodeInvocation(word_t label, word_t length,
                                   cptr_t cptr, cte_t *slot, cap_t cap,
-                                  extra_caps_t extraCaps, bool_t call, word_t *buffer);
+                                  bool_t call, word_t *buffer);
 void Arch_prepareThreadDelete(tcb_t *thread);
 word_t Arch_getObjectSize(word_t t);
 bool_t Arch_isFrameType(word_t type);
@@ -30,3 +31,28 @@ static inline void Arch_postCapDeletion(cap_t cap)
 {
 }
 
+/* Flush the instruction cache for Untypeds that could be turned into non-device
+ * frames. There are no mappings present when this is called, so we can defer
+ * the data flush to retype.*/
+static inline void Arch_postResetUntyped(bool_t deviceMemory, word_t sizeBits)
+{
+    if (!deviceMemory && sizeBits >= seL4_PageBits) {
+        ifence();
+    }
+}
+
+/**
+ * Return true if the given arch cap can be a descendant of an IRQControlCap.
+ */
+static inline CONST bool_t Arch_isIRQControlDescendant(cap_t cap)
+{
+    return false;
+}
+
+/**
+ * isMDBParentOf for architecture caps. See Arm version for more detailed docs.
+ */
+static inline CONST bool_t Arch_isMDBParentOf(cap_t cap_a, cap_t cap_b, bool_t firstBadged)
+{
+    return true;
+}

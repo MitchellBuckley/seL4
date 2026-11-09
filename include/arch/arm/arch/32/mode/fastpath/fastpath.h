@@ -54,6 +54,10 @@ static inline void FORCE_INLINE switchToThread_fp(tcb_t *thread, pde_t *cap_pd, 
     benchmark_utilisation_switch(NODE_STATE(ksCurThread), thread);
 #endif
 
+#ifdef CONFIG_HAVE_FPU
+    lazyFPURestore(thread);
+#endif /* CONFIG_HAVE_FPU */
+
     NODE_STATE(ksCurThread) = thread;
     clearExMonitor_fp();
 }
@@ -114,21 +118,18 @@ static inline int fastpath_reply_cap_check(cap_t cap)
 /** DONT_TRANSLATE */
 static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t msgInfo, tcb_t *cur_thread)
 {
-    NODE_UNLOCK;
-
     c_exit_hook();
+    arm_load_thread_id(cur_thread);
 
-#ifdef CONFIG_ARM_CP14_SAVE_AND_RESTORE_NATIVE_THREADS
-    restore_user_debug_context(NODE_STATE(ksCurThread));
+#ifdef CONFIG_HARDWARE_DEBUG_API
+    restore_user_debug_context(cur_thread);
 #endif
 
-#ifdef CONFIG_HAVE_FPU
-    lazyFPURestore(NODE_STATE(ksCurThread));
-#endif /* CONFIG_HAVE_FPU */
+    NODE_UNLOCK;
 
     register word_t badge_reg asm("r0") = badge;
     register word_t msgInfo_reg asm("r1") = msgInfo;
-    register word_t cur_thread_reg asm("r2") = (word_t)cur_thread;
+    register word_t cur_thread_reg asm("r2") = (word_t)cur_thread->tcbArch.tcbContext.registers;
 
     if (config_set(CONFIG_ARM_HYPERVISOR_SUPPORT)) {
         asm volatile( /* r0 and r1 should be preserved */
@@ -136,7 +137,7 @@ static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t m
             /* Pop user registers, preserving r0 and r1 */
             "add sp, sp, #8     \n"
             "pop {r2-r12}       \n"
-            /* Retore the user stack pointer */
+            /* Restore the user stack pointer */
             "pop {lr}           \n"
             "msr sp_usr, lr     \n"
             /* prepare the exception return lr */
@@ -144,7 +145,7 @@ static inline void NORETURN FORCE_INLINE fastpath_restore(word_t badge, word_t m
             "msr elr_hyp, lr    \n"
             /* prepare the user status register */
             "ldr lr, [sp, #8]   \n"
-            "msr spsr_hyp, lr   \n"
+            "msr spsr_fsxc, lr  \n"
             /* Finally, pop our LR */
             "pop {lr}           \n"
             /* Return to user */

@@ -23,7 +23,7 @@ UP_STATE_DEFINE(interrupt_t, x86KSPendingInterrupt);
 x86_arch_global_state_t x86KSGlobalState[CONFIG_MAX_NUM_NODES] ALIGN(L1_CACHE_LINE_SIZE) SKIM_BSS;
 
 /* The top level ASID table */
-asid_pool_t *x86KSASIDTable[BIT(asidHighBits)];
+asid_pool_t *x86KSASIDTable[nASIDPools];
 
 /* Current user value of the fs/gs base */
 UP_STATE_DEFINE(word_t, x86KSCurrentFSBase);
@@ -55,12 +55,13 @@ uint32_t x86KSFirstValidIODomain;
 
 #ifdef CONFIG_VTX
 UP_STATE_DEFINE(vcpu_t *, x86KSCurrentVCPU);
+UP_STATE_DEFINE(struct vmxon_region, x86KSVMXOnRegion);
 #endif
 
 #ifdef CONFIG_PRINTING
 uint16_t x86KSconsolePort;
 #endif
-#ifdef CONFIG_DEBUG_BUILD
+#if defined(CONFIG_PRINTING) || defined(CONFIG_DEBUG_BUILD)
 uint16_t x86KSdebugPort;
 #endif
 

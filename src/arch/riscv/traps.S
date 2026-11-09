@@ -14,15 +14,14 @@
 
 #define REGBYTES (CONFIG_WORD_SIZE / 8)
 
-.section .text
-
-.global trap_entry
 .extern c_handle_syscall
+.extern c_handle_fastpath_reply_recv
+.extern c_handle_fastpath_call
 .extern c_handle_interrupt
 .extern c_handle_exception
-.extern restore_user_context
 
-trap_entry:
+.section .text.traps, "ax"
+BEGIN_FUNC(trap_entry)
 
 #ifdef ENABLE_SMP_SUPPORT
 /* The sscratch contains the stack for the current core */
@@ -79,7 +78,10 @@ trap_entry:
   csrr s0, scause
   STORE s0, (31*REGBYTES)(t0)
 
+.option push
+.option norelax
   la gp, __global_pointer$
+.option pop
 
 #ifdef ENABLE_SMP_SUPPORT
   /* save the user sp */
@@ -99,14 +101,35 @@ trap_entry:
   /* Check if it's an interrupt */
   bltz s0, interrupt
 
-  li   s4, 8       /* ratified priv has value 8 for ecall exception */
+  /* ratified priv has value 8 for ecall from U-mode exception */
+  li   s4, 8
   bne  s0, s4, exception
 
-syscall:
+handle_syscall:
   /* Set the return address to sepc + 4 in the case of a system/environment call */
   addi x1, x1, 4
   /* Save NextIP */
   STORE   x1, (34*REGBYTES)(t0)
+
+#ifdef CONFIG_FASTPATH
+  li t3, SYSCALL_CALL
+  bne a7, t3, .Ltest_replyrecv
+  j c_handle_fastpath_call
+
+.Ltest_replyrecv:
+  li t3, SYSCALL_REPLY_RECV
+#ifdef CONFIG_KERNEL_MCS
+  /* move reply to 3rd argument */
+  mv a2, a6
+#endif
+  bne a7, t3, .Lslowpath
+  j c_handle_fastpath_reply_recv
+
+.Lslowpath:
+#endif
+
+  /* move syscall number to 3rd argument */
+  mv a2, a7
 
   j c_handle_syscall
 
@@ -120,3 +143,5 @@ interrupt:
   /* Save NextIP */
   STORE   x1, (34*REGBYTES)(t0)
   j c_handle_interrupt
+
+END_FUNC(trap_entry)

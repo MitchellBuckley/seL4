@@ -12,7 +12,7 @@ import logging
 import pyfdt.pyfdt
 
 from jinja2 import Environment, BaseLoader
-from typing import List
+from typing import Dict, List
 
 from hardware import config, device, fdt
 from hardware.utils import cpu, memory, rule
@@ -140,9 +140,15 @@ def get_elfloader_cpus(tree: fdt.FdtParser, devices: List[device.WrappedNode]) -
     return sorted(cpu_info, key=lambda a: a['cpuid'])
 
 
-def run(tree: fdt.FdtParser, hardware: rule.HardwareYaml, config: config.Config, args: argparse.Namespace):
+def run(tree: fdt.FdtParser, hardware: rule.HardwareYaml, config: config.Config, kernel_config_dict: Dict[str, str], args: argparse.Namespace):
     devices = tree.get_elfloader_devices()
     cpu_info = get_elfloader_cpus(tree, devices)
+
+    # On ARM/RISC-V platforms this is how many CPUs the kernel expects to boot.
+    kernel_num_nodes = int(kernel_config_dict["CONFIG_MAX_NUM_NODES"])
+    if len(cpu_info) < kernel_num_nodes:
+        raise ValueError("The kernel is configured with CONFIG_MAX_NUM_NODES ({}) but we only found {} cpus".format(
+            kernel_num_nodes, len(cpu_info)))
 
     max_reg = 1
     device_info = []

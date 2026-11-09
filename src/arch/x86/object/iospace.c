@@ -132,7 +132,9 @@ void unmapVTDContextEntry(cap_t cap)
                false
            );
 
+    /* Removal of a context-table entry */
     flushCacheRange(cte, VTD_CTE_SIZE_BITS);
+    invalidate_context_cache();
     invalidate_iotlb();
     setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
     return;
@@ -171,7 +173,6 @@ exception_t decodeX86IOPTInvocation(
     word_t       length,
     cte_t       *slot,
     cap_t        cap,
-    extra_caps_t excaps,
     word_t      *buffer
 )
 {
@@ -184,7 +185,11 @@ exception_t decodeX86IOPTInvocation(
     vtd_pte_t *vtd_pte;
 
     if (invLabel == X86IOPageTableUnmap) {
-
+        if (!isFinalCapability(slot)) {
+            userError("X86IOPageTableUnmap: Cannot unmap if more than one cap exists.");
+            current_syscall_error.type = seL4_RevokeFirst;
+            return EXCEPTION_SYSCALL_ERROR;
+        }
         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
         return performX86IOPTInvocationUnmap(cap, slot);
     }
@@ -195,13 +200,13 @@ exception_t decodeX86IOPTInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    if (excaps.excaprefs[0] == NULL || length < 1) {
+    if (current_extra_caps.excaprefs[0] == NULL || length < 1) {
         userError("X86IOPageTableMap: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    io_space     = excaps.excaprefs[0]->cap;
+    io_space     = current_extra_caps.excaprefs[0]->cap;
     io_address   = getSyscallArg(0, buffer) & ~MASK(VTD_PT_INDEX_BITS + seL4_PageBits);
 
     if (cap_io_page_table_cap_get_capIOPTIsMapped(cap)) {
@@ -298,7 +303,6 @@ exception_t decodeX86IOMapInvocation(
     word_t       length,
     cte_t       *slot,
     cap_t        cap,
-    extra_caps_t excaps,
     word_t      *buffer
 )
 {
@@ -313,7 +317,7 @@ exception_t decodeX86IOMapInvocation(
     vm_rights_t frame_cap_rights;
     seL4_CapRights_t dma_cap_rights_mask;
 
-    if (excaps.excaprefs[0] == NULL || length < 2) {
+    if (current_extra_caps.excaprefs[0] == NULL || length < 2) {
         userError("X86PageMapIO: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -333,7 +337,7 @@ exception_t decodeX86IOMapInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    io_space    = excaps.excaprefs[0]->cap;
+    io_space    = current_extra_caps.excaprefs[0]->cap;
     io_address  = getSyscallArg(1, buffer) & ~MASK(PAGE_BITS);
     paddr       = pptr_to_paddr((void *)cap_frame_cap_get_capFBasePtr(cap));
 
@@ -428,7 +432,10 @@ void deleteIOPageTable(cap_t io_pt_cap)
                                     0,      /* Translation Type   */
                                     0       /* Present            */
                                 );
+            /* Removal of a context-table entry */
             flushCacheRange(vtd_context_slot, VTD_CTE_SIZE_BITS);
+            invalidate_context_cache();
+            /* IOTLB is invalidated later */
         } else {
             io_address = cap_io_page_table_cap_get_capIOPTMappedAddress(io_pt_cap);
             lu_ret = lookupIOPTSlot_resolve_levels(vtd_pte, io_address >> PAGE_BITS, level - 1, level - 1);
@@ -446,7 +453,9 @@ void deleteIOPageTable(cap_t io_pt_cap)
                                    0,  /* Read Permission  */
                                    0   /* Write Permission */
                                );
+            /* Removal of a Second-stage page-table entry */
             flushCacheRange(lu_ret.ioptSlot, VTD_PTE_SIZE_BITS);
+            /* IOTLB is invalidated later */
         }
         invalidate_iotlb();
     }
@@ -484,6 +493,7 @@ void unmapIOPage(cap_t cap)
                            0   /* Write Permission */
                        );
 
+    /* Removal of a Second-stage page-table entry */
     flushCacheRange(lu_ret.ioptSlot, VTD_PTE_SIZE_BITS);
     invalidate_iotlb();
 }

@@ -15,28 +15,31 @@
 #include <mode/kernel/tlb.h>
 #include <mode/kernel/vspace.h>
 
-static exception_t performPageGetAddress(void *vbase_ptr)
+static exception_t performPageGetAddress(void *vbase_ptr, bool_t call)
 {
-    paddr_t capFBasePtr;
-
     /* Get the physical address of this frame. */
-    capFBasePtr = pptr_to_paddr(vbase_ptr);
+    paddr_t capFBasePtr;
+    capFBasePtr = addrFromPPtr(vbase_ptr);
 
-    /* return it in the first message register */
-    setRegister(NODE_STATE(ksCurThread), msgRegisters[0], capFBasePtr);
-    setRegister(NODE_STATE(ksCurThread), msgInfoRegister,
-                wordFromMessageInfo(seL4_MessageInfo_new(0, 0, 0, 1)));
-
+    tcb_t *thread;
+    thread = NODE_STATE(ksCurThread);
+    if (call) {
+        word_t *ipcBuffer = lookupIPCBuffer(true, thread);
+        setRegister(thread, badgeRegister, 0);
+        unsigned int length = setMR(thread, ipcBuffer, 0, capFBasePtr);
+        setRegister(thread, msgInfoRegister, wordFromMessageInfo(
+                        seL4_MessageInfo_new(0, 0, 0, length)));
+    }
+    setThreadState(NODE_STATE(ksCurThread), ThreadState_Running);
     return EXCEPTION_NONE;
 }
-
 
 void deleteASIDPool(asid_t asid_base, asid_pool_t *pool)
 {
     /* Haskell error: "ASID pool's base must be aligned" */
     assert(IS_ALIGNED(asid_base, asidLowBits));
 
-    if (x86KSASIDTable[asid_base >> asidLowBits] == pool) {
+    if (x86KSASIDTable[ASID_HIGH(asid_base)] == pool) {
         for (unsigned int offset = 0; offset < BIT(asidLowBits); offset++) {
             asid_map_t asid_map = pool->array[offset];
             if (asid_map_get_type(asid_map) == asid_map_asid_map_vspace) {
@@ -44,7 +47,7 @@ void deleteASIDPool(asid_t asid_base, asid_pool_t *pool)
                 hwASIDInvalidate(asid_base + offset, vspace);
             }
         }
-        x86KSASIDTable[asid_base >> asidLowBits] = NULL;
+        x86KSASIDTable[ASID_HIGH(asid_base)] = NULL;
         setVMRoot(NODE_STATE(ksCurThread));
     }
 }
@@ -69,7 +72,7 @@ exception_t performASIDControlInvocation(void *frame, cte_t *slot, cte_t *parent
     );
     /* Haskell error: "ASID pool's base must be aligned" */
     assert((asid_base & MASK(asidLowBits)) == 0);
-    x86KSASIDTable[asid_base >> asidLowBits] = (asid_pool_t *)frame;
+    x86KSASIDTable[ASID_HIGH(asid_base)] = (asid_pool_t *)frame;
 
     return EXCEPTION_NONE;
 }
@@ -78,13 +81,13 @@ void deleteASID(asid_t asid, vspace_root_t *vspace)
 {
     asid_pool_t *poolPtr;
 
-    poolPtr = x86KSASIDTable[asid >> asidLowBits];
+    poolPtr = x86KSASIDTable[ASID_HIGH(asid)];
     if (poolPtr != NULL) {
-        asid_map_t asid_map = poolPtr->array[asid & MASK(asidLowBits)];
+        asid_map_t asid_map = poolPtr->array[ASID_LOW(asid)];
         if (asid_map_get_type(asid_map) == asid_map_asid_map_vspace &&
             (vspace_root_t *)asid_map_asid_map_vspace_get_vspace_root(asid_map) == vspace) {
             hwASIDInvalidate(asid, vspace);
-            poolPtr->array[asid & MASK(asidLowBits)] = asid_map_asid_map_none_new();
+            poolPtr->array[ASID_LOW(asid)] = asid_map_asid_map_none_new();
             setVMRoot(NODE_STATE(ksCurThread));
         }
     }
@@ -526,20 +529,20 @@ BOOT_CODE bool_t init_pat_msr(void)
 BOOT_CODE void write_it_asid_pool(cap_t it_ap_cap, cap_t it_vspace_cap)
 {
     asid_pool_t *ap = ASID_POOL_PTR(pptr_of_cap(it_ap_cap));
-    ap->array[IT_ASID] = asid_map_asid_map_vspace_new(pptr_of_cap(it_vspace_cap));
-    x86KSASIDTable[IT_ASID >> asidLowBits] = ap;
+    ap->array[ASID_LOW(IT_ASID)] = asid_map_asid_map_vspace_new(pptr_of_cap(it_vspace_cap));
+    x86KSASIDTable[ASID_HIGH(IT_ASID)] = ap;
 }
 
 asid_map_t findMapForASID(asid_t asid)
 {
     asid_pool_t        *poolPtr;
 
-    poolPtr = x86KSASIDTable[asid >> asidLowBits];
+    poolPtr = x86KSASIDTable[ASID_HIGH(asid)];
     if (!poolPtr) {
         return asid_map_asid_map_none_new();
     }
 
-    return poolPtr->array[asid & MASK(asidLowBits)];
+    return poolPtr->array[ASID_LOW(asid)];
 }
 
 findVSpaceForASID_ret_t findVSpaceForASID(asid_t asid)
@@ -678,6 +681,11 @@ vm_rights_t CONST maskVMRights(vm_rights_t vm_rights, seL4_CapRights_t cap_right
         } else {
             return VMReadWrite;
         }
+    }
+    if (vm_rights == VMReadWrite &&
+        !seL4_CapRights_get_capAllowRead(cap_rights_mask) &&
+        seL4_CapRights_get_capAllowWrite(cap_rights_mask)) {
+        userError("Attempted to make unsupported write only mapping");
     }
     return VMKernelOnly;
 }
@@ -926,7 +934,7 @@ exception_t decodeX86FrameInvocation(
     word_t length,
     cte_t *cte,
     cap_t cap,
-    extra_caps_t excaps,
+    bool_t call,
     word_t *buffer
 )
 {
@@ -944,7 +952,7 @@ exception_t decodeX86FrameInvocation(
         vm_page_size_t  frameSize;
         asid_t          asid;
 
-        if (length < 3 || excaps.excaprefs[0] == NULL) {
+        if (length < 3 || current_extra_caps.excaprefs[0] == NULL) {
             current_syscall_error.type = seL4_TruncatedMessage;
 
             return EXCEPTION_SYSCALL_ERROR;
@@ -954,7 +962,7 @@ exception_t decodeX86FrameInvocation(
         vaddr = getSyscallArg(0, buffer);
         w_rightsMask = getSyscallArg(1, buffer);
         vmAttr = vmAttributesFromWord(getSyscallArg(2, buffer));
-        vspaceCap = excaps.excaprefs[0]->cap;
+        vspaceCap = current_extra_caps.excaprefs[0]->cap;
 
         capVMRights = cap_frame_cap_get_capFVMRights(cap);
 
@@ -1078,13 +1086,13 @@ exception_t decodeX86FrameInvocation(
 
 #ifdef CONFIG_IOMMU
     case X86PageMapIO: { /* MapIO */
-        return decodeX86IOMapInvocation(length, cte, cap, excaps, buffer);
+        return decodeX86IOMapInvocation(length, cte, cap, buffer);
     }
 #endif
 
 #ifdef CONFIG_VTX
     case X86PageMapEPT:
-        return decodeX86EPTPageMap(invLabel, length, cte, cap, excaps, buffer);
+        return decodeX86EPTPageMap(invLabel, length, cte, cap, buffer);
 #endif
 
     case X86PageGetAddress: {
@@ -1092,7 +1100,7 @@ exception_t decodeX86FrameInvocation(
         assert(n_msgRegisters >= 1);
 
         setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
-        return performPageGetAddress((void *)cap_frame_cap_get_capFBasePtr(cap));
+        return performPageGetAddress((void *)cap_frame_cap_get_capFBasePtr(cap), call);
     }
 
     default:
@@ -1133,7 +1141,6 @@ static exception_t decodeX86PageTableInvocation(
     word_t invLabel,
     word_t length,
     cte_t *cte, cap_t cap,
-    extra_caps_t excaps,
     word_t *buffer
 )
 {
@@ -1162,7 +1169,7 @@ static exception_t decodeX86PageTableInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    if (length < 2 || excaps.excaprefs[0] == NULL) {
+    if (length < 2 || current_extra_caps.excaprefs[0] == NULL) {
         userError("X86PageTable: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -1179,7 +1186,7 @@ static exception_t decodeX86PageTableInvocation(
 
     vaddr = getSyscallArg(0, buffer) & (~MASK(PT_INDEX_BITS + PAGE_BITS));
     attr = vmAttributesFromWord(getSyscallArg(1, buffer));
-    vspaceCap = excaps.excaprefs[0]->cap;
+    vspaceCap = current_extra_caps.excaprefs[0]->cap;
 
     if (!isValidNativeRoot(vspaceCap)) {
         current_syscall_error.type = seL4_InvalidCapability;
@@ -1250,17 +1257,17 @@ exception_t decodeX86MMUInvocation(
     cptr_t cptr,
     cte_t *cte,
     cap_t cap,
-    extra_caps_t excaps,
+    bool_t call,
     word_t *buffer
 )
 {
     switch (cap_get_capType(cap)) {
 
     case cap_frame_cap:
-        return decodeX86FrameInvocation(invLabel, length, cte, cap, excaps, buffer);
+        return decodeX86FrameInvocation(invLabel, length, cte, cap, call, buffer);
 
     case cap_page_table_cap:
-        return decodeX86PageTableInvocation(invLabel, length, cte, cap, excaps, buffer);
+        return decodeX86PageTableInvocation(invLabel, length, cte, cap, buffer);
 
     case cap_asid_control_cap: {
         word_t     i;
@@ -1281,23 +1288,23 @@ exception_t decodeX86MMUInvocation(
             return EXCEPTION_SYSCALL_ERROR;
         }
 
-        if (length < 2 || excaps.excaprefs[0] == NULL
-            || excaps.excaprefs[1] == NULL) {
+        if (length < 2 || current_extra_caps.excaprefs[0] == NULL
+            || current_extra_caps.excaprefs[1] == NULL) {
             current_syscall_error.type = seL4_TruncatedMessage;
             return EXCEPTION_SYSCALL_ERROR;
         }
 
         index = getSyscallArg(0, buffer);
         depth = getSyscallArg(1, buffer);
-        parentSlot = excaps.excaprefs[0];
+        parentSlot = current_extra_caps.excaprefs[0];
         untyped = parentSlot->cap;
-        root = excaps.excaprefs[1]->cap;
+        root = current_extra_caps.excaprefs[1]->cap;
 
         /* Find first free pool */
         for (i = 0; i < nASIDPools && x86KSASIDTable[i]; i++);
 
         if (i == nASIDPools) {
-            /* no unallocated pool is found */
+            userError("ASIDControlMakePool: No unallocated pools found.");
             current_syscall_error.type = seL4_DeleteFirst;
 
             return EXCEPTION_SYSCALL_ERROR;
@@ -1349,13 +1356,13 @@ exception_t decodeX86MMUInvocation(
 
             return EXCEPTION_SYSCALL_ERROR;
         }
-        if (excaps.excaprefs[0] == NULL) {
+        if (current_extra_caps.excaprefs[0] == NULL) {
             current_syscall_error.type = seL4_TruncatedMessage;
 
             return EXCEPTION_SYSCALL_ERROR;
         }
 
-        vspaceCapSlot = excaps.excaprefs[0];
+        vspaceCapSlot = current_extra_caps.excaprefs[0];
         vspaceCap = vspaceCapSlot->cap;
 
         if (!(isVTableRoot(vspaceCap) || VTX_TERNARY(cap_get_capType(vspaceCap) == cap_ept_pml4_cap, 0))
@@ -1367,7 +1374,7 @@ exception_t decodeX86MMUInvocation(
             return EXCEPTION_SYSCALL_ERROR;
         }
 
-        pool = x86KSASIDTable[cap_asid_pool_cap_get_capASIDBase(cap) >> asidLowBits];
+        pool = x86KSASIDTable[ASID_HIGH(cap_asid_pool_cap_get_capASIDBase(cap))];
         if (!pool) {
             current_syscall_error.type = seL4_FailedLookup;
             current_syscall_error.failedLookupWasSource = false;
@@ -1399,6 +1406,6 @@ exception_t decodeX86MMUInvocation(
     }
 
     default:
-        return decodeX86ModeMMUInvocation(invLabel, length, cptr, cte, cap, excaps, buffer);
+        return decodeX86ModeMMUInvocation(invLabel, length, cptr, cte, cap, call, buffer);
     }
 }

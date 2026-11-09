@@ -5,6 +5,9 @@
  */
 
 #pragma once
+
+#include <sel4/config.h>
+
 #include <sel4/types.h>
 #include <sel4/macros.h>
 
@@ -14,6 +17,7 @@
 
 #include <sel4/invocation.h>
 #include <interfaces/sel4_client.h>
+#include <sel4/virtual_client.h>
 
 #include <sel4/bootinfo.h>
 #include <sel4/faults.h>

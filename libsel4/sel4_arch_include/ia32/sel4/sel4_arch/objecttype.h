@@ -6,13 +6,10 @@
 
 #pragma once
 
-#ifdef HAVE_AUTOCONF
-#include <autoconf.h>
-#endif /* HAVE_AUTOCONF */
+#include <sel4/config.h>
 
 typedef enum _mode_object {
     seL4_ModeObjectTypeCount = seL4_NonArchObjectTypeCount,
 } seL4_ModeObjectType;
 
 #define seL4_IA32_PDPTObject 0xffffffff
-

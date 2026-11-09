@@ -1,5 +1,6 @@
 /*
  * Copyright 2020, Data61, CSIRO (ABN 41 687 119 230)
+ * Copyright 2021, HENSOLDT Cyber
  *
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -22,6 +23,14 @@
 #define CR_ALIGN_CLEAR   0
 #endif
 
+#if !defined(CONFIG_ARM_HYPERVISOR_SUPPORT) && defined(CONFIG_AARCH64_USER_CACHE_ENABLE)
+#define CR_USER_CACHE_OPS_SET (BIT(CONTROL_UCT) | BIT(CONTROL_UCI))
+#define CR_USER_CACHE_OPS_CLEAR 0
+#else
+#define CR_USER_CACHE_OPS_SET 0
+#define CR_USER_CACHE_OPS_CLEAR (BIT(CONTROL_UCT) | BIT(CONTROL_UCI))
+#endif
+
 #ifndef CONFIG_DEBUG_DISABLE_L1_ICACHE
     #define CR_L1_ICACHE_SET   BIT(CONTROL_I)
     #define CR_L1_ICACHE_CLEAR 0
@@ -41,11 +50,13 @@
 #define CR_BITS_SET    (CR_ALIGN_SET | \
                         CR_L1_ICACHE_SET | \
                         CR_L1_DCACHE_SET | \
+                        CR_USER_CACHE_OPS_SET | \
                         BIT(CONTROL_M))
 
 #define CR_BITS_CLEAR  (CR_ALIGN_CLEAR | \
                         CR_L1_ICACHE_CLEAR | \
                         CR_L1_DCACHE_CLEAR | \
+                        CR_USER_CACHE_OPS_CLEAR | \
                         BIT(CONTROL_SA0) | \
                         BIT(CONTROL_EE) | \
                         BIT(CONTROL_E0E))
@@ -64,13 +75,13 @@
 #define SCTLR   sctlr_el1
 #endif
 
-.section .boot.text
+.section .boot.text, "ax"
 BEGIN_FUNC(_start)
     /* Save x4 and x5 so we don't clobber it */
     mov     x7, x4
     mov     x8, x5
 
-    /* Make sure interrupts are disable */
+    /* Make sure interrupts are disabled */
     msr daifset, #DAIFSET_MASK
 
     /* Initialise sctlr_el1 or sctlr_el2 register */
@@ -113,9 +124,24 @@ BEGIN_FUNC(_start)
     ldp     x2, x3, [sp], #16
     ldp     x0, x1, [sp], #16
 
-    /* Call bootstrapping implemented in C */
+    /* Call bootstrapping implemented in C with parameters:
+     *  x0: user image physical start address
+     *  x1: user image physical end address
+     *  x2: physical/virtual offset
+     *  x3: user image virtual entry address
+     *  x4: DTB physical address (0 if there is none)
+     *  x5: DTB size (0 if there is none)
+     */
     bl      init_kernel
 
-    /* Restore the initial thread */
+    /* Restore the initial thread. Note that the function restore_user_context()
+     * could technically also be called at the end of init_kernel() directly,
+     * there is no need to return to the assembly code here at all. However, for
+     * verification things are a lot easier when init_kernel() is a normal C
+     * function that returns. The function restore_user_context() is not a
+     * normal C function and thus handled specially in verification, it does
+     * highly architecture specific things to exit to user mode.
+     */
     b restore_user_context
+
 END_FUNC(_start)

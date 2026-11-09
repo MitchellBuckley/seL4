@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
-cmake_minimum_required(VERSION 3.7.2)
+cmake_minimum_required(VERSION 3.16.0)
 
 project(libsel4 C)
 
@@ -28,7 +28,8 @@ config_choice(
 )
 
 config_option(
-    LibSel4StubsUseIPCBufferOnly LIB_SEL4_STUBS_USE_IPC_BUFFER_ONLY
+    LibSel4StubsUseIPCBufferOnly
+    LIB_SEL4_STUBS_USE_IPC_BUFFER_ONLY
     "use only IPC buffer for syscalls. When generating syscall wrappers, only use the \
     IPC buffer for marshalling and unmarshalling arguments. Without this option set, \
     arguments will be passed in registers where possible for better performance."
@@ -43,6 +44,15 @@ config_string(
     UNQUOTE
 )
 
+config_option(
+    LibSel4UseThreadLocals
+    LIB_SEL4_USE_THREAD_LOCALS
+    "mark the __sel4_ipc_buffer variable as thread local using '__thread'. \
+     This requires thread local storage support and is useful if multiple \
+     threads share the same virtual address space."
+    DEFAULT ON
+)
+
 if(LibSel4StubsUseIPCBufferOnly)
     set(buffer "--buffer")
 endif()
@@ -54,22 +64,25 @@ add_config_library(sel4 "${configure_string}")
 # Currently we use autoconf.h, so generate one of those
 generate_autoconf(sel4_autoconf "kernel;sel4")
 
-gen_invocation_header(OUTPUT include/sel4/invocation.h XML include/interfaces/sel4.xml LIBSEL4)
+gen_invocation_header(
+    OUTPUT include/sel4/invocation.h
+    XML include/interfaces/object-api.xml
+    LIBSEL4
+)
 
 gen_invocation_header(
     OUTPUT sel4_arch_include/${KernelSel4Arch}/sel4/sel4_arch/invocation.h
-    XML "${CMAKE_CURRENT_SOURCE_DIR}/sel4_arch_include/${KernelSel4Arch}/interfaces/sel4arch.xml"
+    XML "${CMAKE_CURRENT_SOURCE_DIR}/sel4_arch_include/${KernelSel4Arch}/interfaces/object-api-sel4-arch.xml"
     LIBSEL4 SEL4ARCH
 )
 
 gen_invocation_header(
     OUTPUT arch_include/${KernelArch}/sel4/arch/invocation.h
-    XML "${CMAKE_CURRENT_SOURCE_DIR}/arch_include/${KernelArch}/interfaces/sel4arch.xml"
+    XML "${CMAKE_CURRENT_SOURCE_DIR}/arch_include/${KernelArch}/interfaces/object-api-arch.xml"
     LIBSEL4 ARCH
 )
 
-set(
-    source_header_dirs
+set(source_header_dirs
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/arch_include/${KernelArch}"
     "${CMAKE_CURRENT_SOURCE_DIR}/sel4_arch_include/${KernelSel4Arch}"
@@ -84,14 +97,9 @@ include_directories("$<TARGET_PROPERTY:sel4_autoconf,INTERFACE_INCLUDE_DIRECTORI
 function(genbf target_prefix pbf_location bf_location header_output)
     get_generated_files(gen_list sel4_autoconf_Gen)
     cppfile(
-        "${pbf_location}"
-        ${target_prefix}_pbf
-        "${bf_location}"
-        EXTRA_FLAGS
-        -P
-        EXTRA_DEPS
-        sel4_autoconf_Gen
-        ${gen_list}
+        "${pbf_location}" ${target_prefix}_pbf "${bf_location}"
+        EXTRA_FLAGS -P
+        EXTRA_DEPS sel4_autoconf_Gen ${gen_list}
     )
     GenHBFTarget(
         "libsel4"
@@ -101,19 +109,18 @@ function(genbf target_prefix pbf_location bf_location header_output)
         ${target_prefix}_pbf
         ""
         ""
+        "${bf_location}"
     )
 endfunction(genbf)
 
-genbf(
-    "libsel4_shared_types_gen"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/shared_types_gen/shared_types.pbf"
-    "${CMAKE_CURRENT_SOURCE_DIR}/mode_include/${KernelWordSize}/sel4/shared_types.bf"
-    "${CMAKE_CURRENT_BINARY_DIR}/include/sel4/shared_types_gen.h"
+genbf("libsel4_shared_types_gen" "${CMAKE_CURRENT_BINARY_DIR}/include/sel4/shared_types.pbf"
+      "${CMAKE_CURRENT_SOURCE_DIR}/mode_include/${KernelWordSize}/sel4/shared_types.bf"
+      "${CMAKE_CURRENT_BINARY_DIR}/include/sel4/shared_types_gen.h"
 )
 
 genbf(
     "libsel4_sel4_arch_types_gen"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/sel4_arch_shared_types/types.pbf"
+    "${CMAKE_CURRENT_BINARY_DIR}/sel4_arch_include/${KernelSel4Arch}/sel4/sel4_arch/types.pbf"
     "${CMAKE_CURRENT_SOURCE_DIR}/sel4_arch_include/${KernelSel4Arch}/sel4/sel4_arch/types.bf"
     "${CMAKE_CURRENT_BINARY_DIR}/sel4_arch_include/${KernelSel4Arch}/sel4/sel4_arch/types_gen.h"
 )
@@ -121,69 +128,57 @@ genbf(
 if(KernelIsMCS)
     set(mcs --mcs)
 endif()
+if(KernelX86_64VTX64BitGuests)
+    set(64bitguests --x86-vtx-64-bit-guests)
+endif()
 add_custom_command(
     OUTPUT include/sel4/syscall.h
     COMMAND rm -f include/sel4/syscall.h
-    COMMAND
-        "${XMLLINT_PATH}"
-        --noout
-        --schema
-            "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xsd"
+    COMMAND "${XMLLINT_PATH}" --noout --schema "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xsd"
             "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xml"
     COMMAND
-        ${PYTHON3} "${SYSCALL_ID_GEN_PATH}"
-        --xml "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xml"
-        --libsel4_header include/sel4/syscall.h ${mcs}
-    DEPENDS
-        "${SYSCALL_ID_GEN_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xsd"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xml"
+        ${PYTHON3} "${SYSCALL_ID_GEN_PATH}" --xml
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xml" --libsel4_header
+        include/sel4/syscall.h ${mcs}
+    DEPENDS "${SYSCALL_ID_GEN_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xsd"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/api/syscall.xml"
     COMMENT "Generate syscall.h"
     VERBATIM
 )
 
-set(
-    interface_xmls
-    "${CMAKE_CURRENT_SOURCE_DIR}/sel4_arch_include/${KernelSel4Arch}/interfaces/sel4arch.xml"
-    "${CMAKE_CURRENT_SOURCE_DIR}/arch_include/${KernelArch}/interfaces/sel4arch.xml"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/interfaces/sel4.xml"
+set(interface_xmls
+    "${CMAKE_CURRENT_SOURCE_DIR}/sel4_arch_include/${KernelSel4Arch}/interfaces/object-api-sel4-arch.xml"
+    "${CMAKE_CURRENT_SOURCE_DIR}/arch_include/${KernelArch}/interfaces/object-api-arch.xml"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/interfaces/object-api.xml"
 )
+
 add_custom_command(
     OUTPUT include/interfaces/sel4_client.h
     COMMAND rm -f include/interfaces/sel4_client.h
-    COMMAND
-        echo "CONFIG_WORD_SIZE=${KernelWordSize}" > config
-    COMMAND
-        "${PYTHON3}" "${SYSCALL_STUB_GEN_PATH}" ${buffer} ${mcs} -a "${KernelSel4Arch}" -c config -o
-        include/interfaces/sel4_client.h ${interface_xmls}
-    DEPENDS
-        "${SYSCALL_STUB_GEN_PATH}"
-        ${interface_xmls}
-        BYPRODUCTS
-        config
+    COMMAND "${PYTHON3}" "${SYSCALL_STUB_GEN_PATH}" ${buffer} ${64bitguests} ${mcs} -a
+            "${KernelSel4Arch}" -o include/interfaces/sel4_client.h ${interface_xmls}
+    DEPENDS "${SYSCALL_STUB_GEN_PATH}" ${interface_xmls}
     COMMENT "Generate sel4_client.h"
     VERBATIM
 )
 
 add_custom_target(
     sel4_generated
-    DEPENDS
-        include/interfaces/sel4_client.h
-        include/sel4/syscall.h
-        include/sel4/invocation.h
-        arch_include/${KernelArch}/sel4/arch/invocation.h
-        include/sel4/shared_types_gen.h
-        sel4_arch_include/${KernelSel4Arch}/sel4/sel4_arch/invocation.h
-        sel4_arch_include/${KernelSel4Arch}/sel4/sel4_arch/types_gen.h
+    DEPENDS include/interfaces/sel4_client.h
+            include/sel4/syscall.h
+            include/sel4/invocation.h
+            arch_include/${KernelArch}/sel4/arch/invocation.h
+            include/sel4/shared_types_gen.h
+            sel4_arch_include/${KernelSel4Arch}/sel4/sel4_arch/invocation.h
+            sel4_arch_include/${KernelSel4Arch}/sel4/sel4_arch/types_gen.h
 )
 
 add_library(sel4 src/sel4_bootinfo.c)
 target_link_libraries(sel4 PRIVATE kernel_Config sel4_Config sel4_autoconf)
 target_include_directories(
     sel4
-    PUBLIC
-        ${source_header_dirs}
-        "${CMAKE_CURRENT_BINARY_DIR}/include"
-        "${CMAKE_CURRENT_BINARY_DIR}/arch_include/${KernelArch}"
-        "${CMAKE_CURRENT_BINARY_DIR}/sel4_arch_include/${KernelSel4Arch}"
+    PUBLIC ${source_header_dirs} "${CMAKE_CURRENT_BINARY_DIR}/include"
+           "${CMAKE_CURRENT_BINARY_DIR}/arch_include/${KernelArch}"
+           "${CMAKE_CURRENT_BINARY_DIR}/sel4_arch_include/${KernelSel4Arch}"
 )
 add_dependencies(sel4 sel4_generated)

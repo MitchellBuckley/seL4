@@ -12,6 +12,7 @@
 #include <kernel/cspace.h>
 #include <kernel/thread.h>
 #include <kernel/vspace.h>
+#include <object/domain.h>
 #ifdef CONFIG_KERNEL_MCS
 #include <object/schedcontext.h>
 #endif
@@ -19,15 +20,17 @@
 #include <arch/machine.h>
 #include <arch/kernel/thread.h>
 #include <machine/registerset.h>
+#include <machine/fpu.h>
 #include <linker.h>
 
 static seL4_MessageInfo_t
-transferCaps(seL4_MessageInfo_t info, extra_caps_t caps,
+transferCaps(seL4_MessageInfo_t info,
              endpoint_t *endpoint, tcb_t *receiver,
              word_t *receiveBuffer);
 
 BOOT_CODE void configureIdleThread(tcb_t *tcb)
 {
+    tcb->tcbFlags = seL4_TCBFlag_fpuDisabled;
     Arch_configureIdleThread(tcb);
     setThreadState(tcb, ThreadState_IdleThreadState);
 }
@@ -77,12 +80,12 @@ void suspend(tcb_t *target)
          * running */
         updateRestartPC(target);
     }
-    setThreadState(target, ThreadState_Inactive);
     tcbSchedDequeue(target);
 #ifdef CONFIG_KERNEL_MCS
     tcbReleaseRemove(target);
     schedContext_cancelYieldTo(target);
 #endif
+    setThreadState(target, ThreadState_Inactive);
 }
 
 void restart(tcb_t *target)
@@ -91,7 +94,11 @@ void restart(tcb_t *target)
         cancelIPC(target);
 #ifdef CONFIG_KERNEL_MCS
         setThreadState(target, ThreadState_Restart);
-        schedContext_resume(target->tcbSchedContext);
+        sched_context_t *sc = target->tcbSchedContext;
+        if (sc_sporadic(sc) && sc != NODE_STATE(ksCurSC)) {
+            refill_unblock_check(sc);
+        }
+        schedContext_resume(sc);
         if (isSchedulable(target)) {
             possibleSwitchTo(target);
         }
@@ -135,8 +142,13 @@ void doReplyTransfer(tcb_t *sender, tcb_t *receiver, cte_t *slot, bool_t grant)
 
     tcb_t *receiver = reply->replyTCB;
     reply_remove(reply, receiver);
-    assert(thread_state_get_replyObject(receiver->tcbState) == REPLY_REF(0));
+    assert(thread_state_get_tsType(receiver->tcbState) == ThreadState_Inactive);
     assert(reply->replyTCB == NULL);
+
+    if (sc_sporadic(receiver->tcbSchedContext)
+        && receiver->tcbSchedContext != NODE_STATE_ON_CORE(ksCurSC, receiver->tcbSchedContext->scCore)) {
+        refill_unblock_check(receiver->tcbSchedContext);
+    }
 #else
     assert(thread_state_get_tsType(receiver->tcbState) ==
            ThreadState_BlockedOnReply);
@@ -172,14 +184,15 @@ void doReplyTransfer(tcb_t *sender, tcb_t *receiver, cte_t *slot, bool_t grant)
 
 #ifdef CONFIG_KERNEL_MCS
     if (receiver->tcbSchedContext && isRunnable(receiver)) {
-        if ((refill_ready(receiver->tcbSchedContext) && refill_sufficient(receiver->tcbSchedContext, 0))) {
+        sched_context_t *sc = receiver->tcbSchedContext;
+        if ((refill_ready(sc) && refill_sufficient(sc, 0))) {
             possibleSwitchTo(receiver);
         } else {
             if (validTimeoutHandler(receiver) && fault_type != seL4_Fault_Timeout) {
-                current_fault = seL4_Fault_Timeout_new(receiver->tcbSchedContext->scBadge);
+                current_fault = seL4_Fault_Timeout_new(sc->scBadge);
                 handleTimeout(receiver);
             } else {
-                postpone(receiver->tcbSchedContext);
+                postpone(sc);
             }
         }
     }
@@ -193,25 +206,22 @@ void doNormalTransfer(tcb_t *sender, word_t *sendBuffer, endpoint_t *endpoint,
     word_t msgTransferred;
     seL4_MessageInfo_t tag;
     exception_t status;
-    extra_caps_t caps;
 
     tag = messageInfoFromWord(getRegister(sender, msgInfoRegister));
 
     if (canGrant) {
         status = lookupExtraCaps(sender, sendBuffer, tag);
-        caps = current_extra_caps;
         if (unlikely(status != EXCEPTION_NONE)) {
-            caps.excaprefs[0] = NULL;
+            current_extra_caps.excaprefs[0] = NULL;
         }
     } else {
-        caps = current_extra_caps;
-        caps.excaprefs[0] = NULL;
+        current_extra_caps.excaprefs[0] = NULL;
     }
 
     msgTransferred = copyMRs(sender, sendBuffer, receiver, receiveBuffer,
                              seL4_MessageInfo_get_length(tag));
 
-    tag = transferCaps(tag, caps, endpoint, receiver, receiveBuffer);
+    tag = transferCaps(tag, endpoint, receiver, receiveBuffer);
 
     tag = seL4_MessageInfo_set_length(tag, msgTransferred);
     setRegister(receiver, msgInfoRegister, wordFromMessageInfo(tag));
@@ -232,7 +242,7 @@ void doFaultTransfer(word_t badge, tcb_t *sender, tcb_t *receiver,
 }
 
 /* Like getReceiveSlots, this is specialised for single-cap transfer. */
-static seL4_MessageInfo_t transferCaps(seL4_MessageInfo_t info, extra_caps_t caps,
+static seL4_MessageInfo_t transferCaps(seL4_MessageInfo_t info,
                                        endpoint_t *endpoint, tcb_t *receiver,
                                        word_t *receiveBuffer)
 {
@@ -242,14 +252,14 @@ static seL4_MessageInfo_t transferCaps(seL4_MessageInfo_t info, extra_caps_t cap
     info = seL4_MessageInfo_set_extraCaps(info, 0);
     info = seL4_MessageInfo_set_capsUnwrapped(info, 0);
 
-    if (likely(!caps.excaprefs[0] || !receiveBuffer)) {
+    if (likely(!current_extra_caps.excaprefs[0] || !receiveBuffer)) {
         return info;
     }
 
     destSlot = getReceiveSlots(receiver, receiveBuffer);
 
-    for (i = 0; i < seL4_MsgMaxExtraCaps && caps.excaprefs[i] != NULL; i++) {
-        cte_t *slot = caps.excaprefs[i];
+    for (i = 0; i < seL4_MsgMaxExtraCaps && current_extra_caps.excaprefs[i] != NULL; i++) {
+        cte_t *slot = current_extra_caps.excaprefs[i];
         cap_t cap = slot->cap;
 
         if (cap_get_capType(cap) == cap_endpoint_cap &&
@@ -293,33 +303,51 @@ void doNBRecvFailedTransfer(tcb_t *thread)
     setRegister(thread, badgeRegister, 0);
 }
 
+void prepareSetDomain(tcb_t *tptr, dom_t dom)
+{
+    if (ksCurDomain != dom) {
+        Arch_prepareSetDomain(tptr, dom);
+#ifdef CONFIG_HAVE_FPU
+        /* Save FPU state now to avoid touching cross-domain state later */
+        fpuRelease(tptr);
+#endif
+    }
+}
+
+static void prepareNextDomain(void)
+{
+    Arch_prepareNextDomain();
+#ifdef CONFIG_HAVE_FPU
+    /* Save FPU state now to avoid touching cross-domain state later */
+    switchLocalFpuOwner(NULL);
+#endif
+}
+
 static void nextDomain(void)
 {
     ksDomScheduleIdx++;
-    if (ksDomScheduleIdx >= ksDomScheduleLength) {
-        ksDomScheduleIdx = 0;
+    if (dschedule_is_end_marker(ksDomScheduleIdx)) {
+        ksDomScheduleIdx = ksDomScheduleStart;
     }
 #ifdef CONFIG_KERNEL_MCS
     NODE_STATE(ksReprogram) = true;
 #endif
     ksWorkUnitsCompleted = 0;
-    ksCurDomain = ksDomSchedule[ksDomScheduleIdx].domain;
-#ifdef CONFIG_KERNEL_MCS
-    ksDomainTime = usToTicks(ksDomSchedule[ksDomScheduleIdx].length * US_IN_MS);
-#else
-    ksDomainTime = ksDomSchedule[ksDomScheduleIdx].length;
-#endif
+    ksCurDomain = dschedule_domain(ksDomSchedule[ksDomScheduleIdx]);
+    ksDomainTime = dschedule_duration(ksDomSchedule[ksDomScheduleIdx]);
 }
 
 #ifdef CONFIG_KERNEL_MCS
 static void switchSchedContext(void)
 {
-    if (unlikely(NODE_STATE(ksCurSC) != NODE_STATE(ksCurThread)->tcbSchedContext) && NODE_STATE(ksCurSC)->scRefillMax) {
+    if (unlikely(NODE_STATE(ksCurSC) != NODE_STATE(ksCurThread)->tcbSchedContext)) {
         NODE_STATE(ksReprogram) = true;
-        refill_unblock_check(NODE_STATE(ksCurThread->tcbSchedContext));
+        if (sc_constant_bandwidth(NODE_STATE(ksCurThread)->tcbSchedContext)) {
+            refill_unblock_check(NODE_STATE(ksCurThread)->tcbSchedContext);
+        }
 
-        assert(refill_ready(NODE_STATE(ksCurThread->tcbSchedContext)));
-        assert(refill_sufficient(NODE_STATE(ksCurThread->tcbSchedContext), 0));
+        assert(refill_ready(NODE_STATE(ksCurThread)->tcbSchedContext));
+        assert(refill_sufficient(NODE_STATE(ksCurThread)->tcbSchedContext, 0));
     }
 
     if (NODE_STATE(ksReprogram)) {
@@ -335,6 +363,7 @@ static void switchSchedContext(void)
 static void scheduleChooseNewThread(void)
 {
     if (ksDomainTime == 0) {
+        prepareNextDomain();
         nextDomain();
     }
     chooseThread();
@@ -344,6 +373,7 @@ void schedule(void)
 {
 #ifdef CONFIG_KERNEL_MCS
     awaken();
+    checkDomainTime();
 #endif
 
     if (NODE_STATE(ksSchedulerAction) != SchedulerAction_ResumeCurrentThread) {
@@ -408,7 +438,7 @@ void chooseThread(void)
     word_t dom;
     tcb_t *thread;
 
-    if (CONFIG_NUM_DOMAINS > 1) {
+    if (numDomains > 1) {
         dom = ksCurDomain;
     } else {
         dom = 0;
@@ -442,6 +472,11 @@ void switchToThread(tcb_t *thread)
     benchmark_utilisation_switch(NODE_STATE(ksCurThread), thread);
 #endif
     Arch_switchToThread(thread);
+
+#ifdef CONFIG_HAVE_FPU
+    lazyFPURestore(thread);
+#endif /* CONFIG_HAVE_FPU */
+
     tcbSchedDequeue(thread);
     NODE_STATE(ksCurThread) = thread;
 }
@@ -551,49 +586,67 @@ void scheduleTCB(tcb_t *tptr)
     if (tptr == NODE_STATE(ksCurThread) &&
         NODE_STATE(ksSchedulerAction) == SchedulerAction_ResumeCurrentThread &&
         !isSchedulable(tptr)) {
-        rescheduleRequired();
+        /* short-cut rescheduleRequired(), because we know what the scheduler action is. */
+        NODE_STATE(ksSchedulerAction) = SchedulerAction_ChooseNewThread;
     }
 }
 
 #ifdef CONFIG_KERNEL_MCS
 void postpone(sched_context_t *sc)
 {
-    tcbSchedDequeue(sc->scTcb);
-    tcbReleaseEnqueue(sc->scTcb);
+    tcb_t *tcb = sc->scTcb;
+    assert(tcb != NULL);
+
+    tcbSchedDequeue(tcb);
+    tcbReleaseEnqueue(tcb);
     NODE_STATE_ON_CORE(ksReprogram, sc->scCore) = true;
 }
 
 void setNextInterrupt(void)
 {
-    time_t next_interrupt = NODE_STATE(ksCurTime) +
-                            refill_head(NODE_STATE(ksCurThread)->tcbSchedContext)->rAmount;
+    /* fetch the head refill separately to ease verification */
+    refill_t ct_head_refill = *refill_head(NODE_STATE(ksCurThread)->tcbSchedContext);
+    ticks_t next_interrupt = NODE_STATE(ksCurTime) + ct_head_refill.rAmount;
 
-    if (CONFIG_NUM_DOMAINS > 1) {
+    if (numDomains > 1) {
         next_interrupt = MIN(next_interrupt, NODE_STATE(ksCurTime) + ksDomainTime);
     }
 
-    if (NODE_STATE(ksReleaseHead) != NULL) {
-        next_interrupt = MIN(refill_head(NODE_STATE(ksReleaseHead)->tcbSchedContext)->rTime, next_interrupt);
+    tcb_t *rlq_head = NODE_STATE(ksReleaseQueue.head);
+    if (rlq_head != NULL) {
+        /* fetch the head refill separately to ease verification */
+        refill_t rlq_head_refill = *refill_head(rlq_head->tcbSchedContext);
+        next_interrupt = MIN(rlq_head_refill.rTime, next_interrupt);
     }
 
+    /* We should never be attempting to schedule anything earlier than ksCurTime */
+    assert(next_interrupt >= NODE_STATE(ksCurTime));
+
+    /* Our lower bound ksCurTime is slightly in the past (at kernel entry) and
+       we are further subtracting getTimerPrecision(), so we may be setting a
+       deadline in the past. If that is the case, we assume the IRQ will be
+       raised immediately after we leave the kernel. */
     setDeadline(next_interrupt - getTimerPrecision());
 }
 
-void chargeBudget(ticks_t consumed, bool_t canTimeoutFault, word_t core, bool_t isCurCPU)
+void chargeBudget(ticks_t consumed, bool_t canTimeoutFault)
 {
+    if (likely(NODE_STATE(ksCurSC) != NODE_STATE(ksIdleSC))) {
+        if (isRoundRobin(NODE_STATE(ksCurSC))) {
+            assert(refill_size(NODE_STATE(ksCurSC)) == MIN_REFILLS);
+            refill_t head = *refill_head(NODE_STATE(ksCurSC));
+            refill_t tail = *refill_tail(NODE_STATE(ksCurSC));
+            refill_head(NODE_STATE(ksCurSC))->rAmount = head.rAmount + tail.rAmount;
+            refill_tail(NODE_STATE(ksCurSC))->rAmount = 0;
+        } else {
+            refill_budget_check(consumed);
+        }
 
-    if (isRoundRobin(NODE_STATE_ON_CORE(ksCurSC, core))) {
-        assert(refill_size(NODE_STATE_ON_CORE(ksCurSC, core)) == MIN_REFILLS);
-        refill_head(NODE_STATE_ON_CORE(ksCurSC, core))->rAmount += refill_tail(NODE_STATE_ON_CORE(ksCurSC, core))->rAmount;
-        refill_tail(NODE_STATE_ON_CORE(ksCurSC, core))->rAmount = 0;
-    } else {
-        refill_budget_check(consumed);
+        assert(refill_head(NODE_STATE(ksCurSC))->rAmount >= MIN_BUDGET);
+        NODE_STATE(ksCurSC)->scConsumed += consumed;
     }
-
-    assert(refill_head(NODE_STATE_ON_CORE(ksCurSC, core))->rAmount >= MIN_BUDGET);
-    NODE_STATE_ON_CORE(ksCurSC, core)->scConsumed += consumed;
-    NODE_STATE_ON_CORE(ksConsumed, core) = 0;
-    if (isCurCPU && likely(isSchedulable(NODE_STATE_ON_CORE(ksCurThread, core)))) {
+    NODE_STATE(ksConsumed) = 0;
+    if (likely(isSchedulable(NODE_STATE(ksCurThread)))) {
         assert(NODE_STATE(ksCurThread)->tcbSchedContext == NODE_STATE(ksCurSC));
         endTimeslice(canTimeoutFault);
         rescheduleRequired();
@@ -603,12 +656,14 @@ void chargeBudget(ticks_t consumed, bool_t canTimeoutFault, word_t core, bool_t 
 
 void endTimeslice(bool_t can_timeout_fault)
 {
-    if (can_timeout_fault && !isRoundRobin(NODE_STATE(ksCurSC)) && validTimeoutHandler(NODE_STATE(ksCurThread))) {
+    bool_t round_robin = isRoundRobin(NODE_STATE(ksCurSC));
+    bool_t valid = validTimeoutHandler(NODE_STATE(ksCurThread));
+
+    if (can_timeout_fault && !round_robin && valid) {
         current_fault = seL4_Fault_Timeout_new(NODE_STATE(ksCurSC)->scBadge);
         handleTimeout(NODE_STATE(ksCurThread));
     } else if (refill_ready(NODE_STATE(ksCurSC)) && refill_sufficient(NODE_STATE(ksCurSC), 0)) {
         /* apply round robin */
-        assert(refill_sufficient(NODE_STATE(ksCurSC), 0));
         assert(!thread_state_get_tcbQueued(NODE_STATE(ksCurThread)->tcbState));
         SCHED_APPEND_CURRENT_TCB;
     } else {
@@ -636,7 +691,7 @@ void timerTick(void)
         }
     }
 
-    if (CONFIG_NUM_DOMAINS > 1) {
+    if (numDomains > 1) {
         ksDomainTime--;
         if (ksDomainTime == 0) {
             rescheduleRequired();
@@ -663,21 +718,35 @@ void rescheduleRequired(void)
 }
 
 #ifdef CONFIG_KERNEL_MCS
+
+static inline bool_t PURE release_q_non_empty_and_ready(void)
+{
+    return NODE_STATE(ksReleaseQueue.head) != NULL
+           && refill_ready(NODE_STATE(ksReleaseQueue.head)->tcbSchedContext);
+}
+
+static void tcbReleaseDequeue(void)
+{
+    assert(NODE_STATE(ksReleaseQueue.head) != NULL);
+    assert(NODE_STATE(ksReleaseQueue.head)->tcbSchedPrev == NULL);
+    SMP_COND_STATEMENT(assert(NODE_STATE(ksReleaseQueue.head)->tcbAffinity == getCurrentCPUIndex()));
+
+    tcb_t *awakened = NODE_STATE(ksReleaseQueue.head);
+    assert(awakened != NODE_STATE(ksCurThread));
+    tcbReleaseRemove(awakened);
+    /* round robin threads should not be in the release queue */
+    assert(!isRoundRobin(awakened->tcbSchedContext));
+    /* threads should wake up on the correct core */
+    SMP_COND_STATEMENT(assert(awakened->tcbAffinity == getCurrentCPUIndex()));
+    /* threads HEAD refill should always be >= MIN_BUDGET */
+    assert(refill_sufficient(awakened->tcbSchedContext, 0));
+    possibleSwitchTo(awakened);
+}
+
 void awaken(void)
 {
-    while (unlikely(NODE_STATE(ksReleaseHead) != NULL && refill_ready(NODE_STATE(ksReleaseHead)->tcbSchedContext))) {
-        tcb_t *awakened = tcbReleaseDequeue();
-        /* the currently running thread cannot have just woken up */
-        assert(awakened != NODE_STATE(ksCurThread));
-        /* round robin threads should not be in the release queue */
-        assert(!isRoundRobin(awakened->tcbSchedContext));
-        /* threads should wake up on the correct core */
-        SMP_COND_STATEMENT(assert(awakened->tcbAffinity == getCurrentCPUIndex()));
-        /* threads HEAD refill should always be > MIN_BUDGET */
-        assert(refill_sufficient(awakened->tcbSchedContext, 0));
-        possibleSwitchTo(awakened);
-        /* changed head of release queue -> need to reprogram */
-        NODE_STATE(ksReprogram) = true;
+    while (unlikely(release_q_non_empty_and_ready())) {
+        tcbReleaseDequeue();
     }
 }
 #endif

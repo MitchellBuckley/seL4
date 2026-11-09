@@ -1,5 +1,6 @@
 /*
  * Copyright 2014, General Dynamics C4 Systems
+ * Copyright 2021, HENSOLDT Cyber
  *
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -115,21 +116,11 @@ BEGIN_FUNC(_start)
     mcr p15, 0, r4, c1, c0, 1
 #endif
 
-#if defined(CONFIG_PLAT_HIKEY)
-    /* Prefetcher configuration */
-   mrrc p15, 0, r4, r5, c15
-   ldr r6, =PREFETCHER_MASK
-   bic r4, r4, r6
-   ldr r6, =PREFETCHER
-   orr r4, r4, r6
-   mcrr p15, 0, r4, r5, c15
-#endif
-
      /* Load kernel stack pointer
       * On ARM SMP, kernel_stack_alloc is indexed by CPU ID
       * to get different stacks for each core
       */
-    ldr sp, =kernel_stack_alloc + BIT(CONFIG_KERNEL_STACK_BITS)
+    ldr sp, =kernel_stack_alloc + BIT(CONFIG_KERNEL_STACK_BITS) - 8
 
 #ifdef ENABLE_SMP_SUPPORT
     /*
@@ -145,25 +136,49 @@ BEGIN_FUNC(_start)
     add     sp, sp, r5
 #endif /* ENABLE_SMP_SUPPORT */
 
+    /* Hyp kernel always run in Hyp mode. */
+#ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
+    /* Initialise ABORT stack pointer.
+     * For ARM, the `sp' register is banked between PMODEs, so we configure
+     * a stack for when we take a exception (see traps.S, where we then switch
+     * modes and load the real kernel stack). */
+    cps #PMODE_ABORT
+    ldr sp, =_abort_stack_top
+#ifdef ENABLE_SMP_SUPPORT
+    /* Give each core its own abort stack */
+    ldr     r5, =4096
+    mul     r5, r4
+    add     sp, sp, r5
+#endif
+    cps #PMODE_SUPERVISOR
+#endif
+
     /* Attempt to workaround any known ARM errata. */
     push {r0-r3,r7-r8}
     blx arm_errata
     pop {r0-r3,r7-r8}
 
-    /* Hyp kernel always run in Hyp mode. */
-#ifndef CONFIG_ARM_HYPERVISOR_SUPPORT
-    /* Initialise ABORT stack pointer */
-    cps #PMODE_ABORT
-    ldr sp, =_breakpoint_stack_top
-    cps #PMODE_SUPERVISOR
-#endif
-
     /* Put the DTB address back on the new stack for init_kernel. */
     push {r7, r8}
-    /* Call bootstrapping implemented in C */
+
+    /* Call bootstrapping implemented in C with parameters:
+     *   r0: user image physical start address
+     *   r1: user image physical end address
+     *   r2: physical/virtual offset
+     *   r3: user image virtual entry address
+     *   sp[0]: DTB physical address (0 if there is none)
+     *   sp[1]: DTB size (0 if there is none)
+     */
     blx init_kernel
 
-    /* Restore the initial thread */
+    /* Restore the initial thread. Note that the function restore_user_context()
+     * could technically also be called at the end of init_kernel() directly,
+     * there is no need to return to the assembly code here at all. However, for
+     * verification things are a lot easier when init_kernel() is a normal C
+     * function that returns. The function restore_user_context() is not a
+     * normal C function and thus handled specially in verification, it does
+     * highly architecture specific things to exit to user mode.
+     */
     b restore_user_context
 
 END_FUNC(_start)

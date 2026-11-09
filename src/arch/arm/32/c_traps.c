@@ -9,7 +9,6 @@
 #include <arch/fastpath/fastpath.h>
 #include <arch/kernel/traps.h>
 #include <arch/machine/debug.h>
-#include <arch/machine/debug_conf.h>
 #include <api/syscall.h>
 #include <linker.h>
 #include <machine/fpu.h>
@@ -20,19 +19,16 @@
 /** DONT_TRANSLATE */
 void VISIBLE NORETURN restore_user_context(void)
 {
-    NODE_UNLOCK_IF_HELD;
-
     word_t cur_thread_reg = (word_t) NODE_STATE(ksCurThread);
 
     c_exit_hook();
+    arm_load_thread_id(NODE_STATE(ksCurThread));
 
-#ifdef ARM_CP14_SAVE_AND_RESTORE_NATIVE_THREADS
+#ifdef CONFIG_HARDWARE_DEBUG_API
     restore_user_debug_context(NODE_STATE(ksCurThread));
 #endif
 
-#ifdef CONFIG_HAVE_FPU
-    lazyFPURestore(NODE_STATE(ksCurThread));
-#endif /* CONFIG_HAVE_FPU */
+    NODE_UNLOCK_IF_HELD;
 
     if (config_set(CONFIG_ARM_HYPERVISOR_SUPPORT)) {
         asm volatile(
@@ -40,7 +36,7 @@ void VISIBLE NORETURN restore_user_context(void)
             "mov sp, %[cur_thread_reg] \n"
             /* Pop user registers */
             "pop {r0-r12}              \n"
-            /* Retore the user stack pointer */
+            /* Restore the user stack pointer */
             "pop {lr}                  \n"
             "msr sp_usr, lr            \n"
             /* prepare the exception return lr */
@@ -48,7 +44,7 @@ void VISIBLE NORETURN restore_user_context(void)
             "msr elr_hyp, lr           \n"
             /* prepare the user status register */
             "ldr lr, [sp, #8]          \n"
-            "msr spsr_hyp, lr          \n"
+            "msr spsr_fsxc, lr         \n"
             /* Finally, pop our LR */
             "pop {lr}                  \n"
             /* Return to user */

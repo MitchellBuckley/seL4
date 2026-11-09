@@ -13,6 +13,9 @@
 #include <api/failures.h>
 #include <linker.h>
 
+#define HCR_TID5     BIT(58)     /* Trap ID group 5 (GMID_EL1)     */
+#define HCR_TERR     BIT(36)     /* Trap RAS error record access   */
+#define HCR_TLOR     BIT(35)     /* Trap LOR registers             */
 #define HCR_RW       BIT(31)     /* Execution state control        */
 #define HCR_TRVM     BIT(30)     /* trap reads of VM controls      */
 #define HCR_HCD      BIT(29)     /* Disable HVC                    */
@@ -24,7 +27,7 @@
 #define HCR_TPC      BIT(23)     /* Trap cache maintenance PoC     */
 #define HCR_TSW      BIT(22)     /* Trap cache maintenance set/way */
 #define HCR_TCACHE   (HCR_TPU | HCR_TPC | HCR_TSW)
-#define HCR_TAC      BIT(21)     /* Trap ACTLR access              */
+#define HCR_TACR     BIT(21)     /* Trap ACTLR access              */
 #define HCR_TIDCP    BIT(20)     /* Trap lockdown                  */
 #define HCR_TSC      BIT(19)     /* Trap SMC instructions          */
 #define HCR_TID3     BIT(18)     /* Trap ID register 3             */
@@ -47,12 +50,14 @@
 #define HCR_SWIO     BIT( 1)     /* set/way invalidate override    */
 #define HCR_VM       BIT( 0)     /* Virtualization MMU enable      */
 
-#define GIC_VCPU_MAX_NUM_LR 64
 
 struct gicVCpuIface {
     uint32_t hcr;
     uint32_t vmcr;
     uint32_t apr;
+    /* virq_t[] requires word-size alignment; add extra padding for
+     * 64-bit platforms to make this struct packed. */
+    uint32_t gicVCpuIface_padding;
     virq_t lr[GIC_VCPU_MAX_NUM_LR];
 };
 
@@ -76,16 +81,25 @@ struct vcpu {
     word_t regs[seL4_VCPUReg_Num];
     bool_t vppi_masked[n_VPPIEventIRQ];
 #ifdef CONFIG_VTIMER_UPDATE_VOFFSET
-    /* vTimer is 8-bytes wide and has same alignment requirement.
-     * To keep the struct packed on 32-bit platforms when accompanied by an
-     * odd number of 32-bit words, we need to add a padding word.
-     * */
+#ifdef CONFIG_ARCH_AARCH32
+    /* vTimer is 8-bytes wide and has the same 8-byte alignment requirement.
+     * On 32-bit platforms, if the sum of n_VPPIEventIRQ and seL4_VCPUReg_Num
+     * is odd, we do not need extra padding. If the sum is even we do. It
+     * currently is even, so the padding below is necessary for the struct to
+     * remain packed. On 64-bit platforms all members are 8-byte aligned and
+     * no padding is needed.
+     */
     word_t vcpu_padding;
+#endif
     struct vTimer virtTimer;
 #endif
 };
 typedef struct vcpu vcpu_t;
 compile_assert(vcpu_size_correct, sizeof(struct vcpu) <= BIT(VCPU_SIZE_BITS))
+#if defined(CONFIG_VTIMER_UPDATE_VOFFSET) && defined(CONFIG_ARCH_AARCH32)
+compile_assert(vcpu_virt_timer_alignment_valid,
+               (seL4_VCPUReg_Num + n_VPPIEventIRQ) % 2 == 0)
+#endif
 
 void VGICMaintenance(void);
 void handleVCPUFault(word_t hsr);
@@ -105,26 +119,27 @@ void dissociateVCPUTCB(vcpu_t *vcpu, tcb_t *tcb);
 
 exception_t decodeARMVCPUInvocation(
     word_t label,
-    unsigned int length,
+    word_t length,
     cptr_t cptr,
     cte_t *slot,
     cap_t cap,
-    extra_caps_t extraCaps,
     bool_t call,
     word_t *buffer
 );
 
 void vcpu_restore(vcpu_t *cpu);
 void vcpu_switch(vcpu_t *cpu);
+void vcpu_flush(void);
+void vcpu_flush_if_current(tcb_t *tptr);
 #ifdef ENABLE_SMP_SUPPORT
 void handleVCPUInjectInterruptIPI(vcpu_t *vcpu, unsigned long index, virq_t virq);
 #endif /* ENABLE_SMP_SUPPORT */
 
-exception_t decodeVCPUWriteReg(cap_t cap, unsigned int length, word_t *buffer);
-exception_t decodeVCPUReadReg(cap_t cap, unsigned int length, bool_t call, word_t *buffer);
-exception_t decodeVCPUInjectIRQ(cap_t cap, unsigned int length, word_t *buffer);
-exception_t decodeVCPUSetTCB(cap_t cap, extra_caps_t extraCaps);
-exception_t decodeVCPUAckVPPI(cap_t cap, unsigned int length, word_t *buffer);
+exception_t decodeVCPUWriteReg(cap_t cap, word_t length, word_t *buffer);
+exception_t decodeVCPUReadReg(cap_t cap, word_t length, bool_t call, word_t *buffer);
+exception_t decodeVCPUInjectIRQ(cap_t cap, word_t length, word_t *buffer);
+exception_t decodeVCPUSetTCB(cap_t cap);
+exception_t decodeVCPUAckVPPI(cap_t cap, word_t length, word_t *buffer);
 
 exception_t invokeVCPUWriteReg(vcpu_t *vcpu, word_t field, word_t value);
 exception_t invokeVCPUReadReg(vcpu_t *vcpu, word_t field, bool_t call);
@@ -197,9 +212,10 @@ static inline VPPIEventIRQ_t irqVPPIEventIndex(irq_t irq)
 
 #else /* end of CONFIG_ARM_HYPERVISOR_SUPPORT */
 
-/* used in boot.c with a guard, use a marco to avoid exposing vcpu_t */
 #define vcpu_boot_init() do {} while(0)
 #define vcpu_switch(x) do {} while(0)
+#define vcpu_flush() do {} while(0)
+#define vcpu_flush_if_current(x) do {} while(0)
 static inline void VGICMaintenance(void) {}
 
 #endif /* end of !CONFIG_ARM_HYPERVISOR_SUPPORT */

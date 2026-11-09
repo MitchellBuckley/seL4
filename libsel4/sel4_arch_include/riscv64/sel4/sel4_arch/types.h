@@ -6,9 +6,5 @@
 
 #pragma once
 
-#include <autoconf.h>
+#include <sel4/config.h>
 #include <sel4/simple_types.h>
-
-#define seL4_WordBits        64
-typedef seL4_Uint64 seL4_Word;
-

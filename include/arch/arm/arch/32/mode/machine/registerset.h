@@ -32,6 +32,14 @@
                              | PMODE_IDLE         \
                              | CPSR_EXTRA_FLAGS   )
 
+#define FPEXC_EX_BIT        31
+#define FPEXC_EN_BIT        30
+#define FPEXC_DEX_BIT       29
+#define FPEXC_FP2V_BIT      28
+
+/* ID_PFR0 register */
+#define ID_PFR0_RAS         28     // RAS extension
+
 /* Offsets within the user context, these need to match the order in
  * register_t below */
 #define PT_SP               (13  * 4)
@@ -41,13 +49,6 @@
 #define PT_TPIDRURW         (18 * 4)
 #define PT_R8               (8  * 4)
 
-#ifdef CONFIG_KERNEL_GLOBALS_FRAME
-/*
- * Virtualise the TPIDRURW register in the globals frame.
- */
-#define GLOBALS_TPIDRURW 0
-#endif
-
 #ifndef __ASSEMBLER__ /* C only definitions */
 
 #include <config.h>
@@ -55,7 +56,6 @@
 #include <assert.h>
 #include <util.h>
 #include <arch/types.h>
-#include <arch/machine/debug_conf.h>
 #include <sel4/plat/api/constants.h>
 
 /* These are the indices of the registers in the
@@ -107,9 +107,13 @@ enum _register {
     /* user readable/writable thread ID register.
      * name comes from the ARM manual */
     TPIDRURW = 18,
-    TLS_BASE = TPIDRURW,
     /* user readonly thread ID register. */
     TPIDRURO = 19,
+#ifdef CONFIG_ARM_TLS_REG_TPIDRU
+    TLS_BASE = TPIDRURW,
+#elif defined(CONFIG_ARM_TLS_REG_TPIDRURO)
+    TLS_BASE = TPIDRURO,
+#endif
     n_contextRegisters = 20,
 };
 
@@ -122,6 +126,9 @@ compile_assert(elr_hyp_offset_correct, ELR_hyp *sizeof(word_t) == PT_ELR_hyp)
 #endif
 compile_assert(faultinstruction_offset_correct, FaultIP *sizeof(word_t) == PT_FaultIP)
 compile_assert(r8_offset_correct, R8 *sizeof(word_t) == PT_R8)
+compile_assert(tpidrurw_offset_even, (PT_TPIDRURW & 1) == 0)
+compile_assert(tpidrurw_offset_correct, TPIDRURW *sizeof(word_t) == PT_TPIDRURW)
+compile_assert(tpidruro_offset_correct, TPIDRURO == TPIDRURW + 1)
 
 typedef word_t register_t;
 
@@ -184,7 +191,7 @@ extern const register_t msgRegisters[];
 extern const register_t frameRegisters[];
 extern const register_t gpRegisters[];
 
-#ifdef ARM_BASE_CP14_SAVE_AND_RESTORE
+#ifdef CONFIG_HARDWARE_DEBUG_API
 typedef struct debug_register_pair {
     word_t cr, vr;
 } debug_register_pair_t;
@@ -194,16 +201,16 @@ typedef struct debug_register_pair {
  * the size of the untyped needed for a TCB when watchpoint handling is
  * involved.
  */
-#define EXLUSIVE_WATCHPOINT_PADING 6
-#define EXLUSIVE_WATCHPOINT_PADDED \
-    (seL4_NumExclusiveWatchpoints > EXLUSIVE_WATCHPOINT_PADING) \
+#define EXCLUSIVE_WATCHPOINT_PADDING 6
+#define EXCLUSIVE_WATCHPOINT_PADDED \
+    (seL4_NumExclusiveWatchpoints > EXCLUSIVE_WATCHPOINT_PADDING) \
         ? seL4_NumExclusiveWatchpoints \
-        : EXLUSIVE_WATCHPOINT_PADING
+        : EXCLUSIVE_WATCHPOINT_PADDING
 
 typedef struct user_breakpoint_state {
     /* We don't use context comparisons. */
     debug_register_pair_t breakpoint[seL4_NumExclusiveBreakpoints],
-                          watchpoint[EXLUSIVE_WATCHPOINT_PADDED];
+                          watchpoint[EXCLUSIVE_WATCHPOINT_PADDED];
     uint32_t used_breakpoints_bf;
     word_t n_instructions;
     bool_t single_step_enabled;
@@ -214,7 +221,6 @@ typedef struct user_breakpoint_state {
 #ifdef CONFIG_HAVE_FPU
 typedef struct user_fpu_state {
     uint64_t fpregs[32];
-    uint32_t fpexc;
     uint32_t fpscr;
 } user_fpu_state_t;
 #endif /* CONFIG_HAVE_FPU */
@@ -229,26 +235,26 @@ typedef struct user_fpu_state {
  */
 struct user_context {
     word_t registers[n_contextRegisters];
-#ifdef ARM_BASE_CP14_SAVE_AND_RESTORE
-    user_breakpoint_state_t breakpointState;
-#endif /* CONFIG_HARDWARE_DEBUG_API */
 #ifdef CONFIG_HAVE_FPU
     user_fpu_state_t fpuState;
 #endif /* CONFIG_HAVE_FPU */
+#ifdef CONFIG_HARDWARE_DEBUG_API
+    user_breakpoint_state_t breakpointState;
+#endif /* CONFIG_HARDWARE_DEBUG_API */
 };
 typedef struct user_context user_context_t;
 
 unverified_compile_assert(registers_are_first_member_of_user_context,
                           OFFSETOF(user_context_t, registers) == 0)
 
-#ifdef ARM_BASE_CP14_SAVE_AND_RESTORE
+#ifdef CONFIG_HARDWARE_DEBUG_API
 void Arch_initBreakpointContext(user_context_t *context);
 #endif
 
 static inline void Arch_initContext(user_context_t *context)
 {
     context->registers[CPSR] = CPSR_USER;
-#ifdef ARM_BASE_CP14_SAVE_AND_RESTORE
+#ifdef CONFIG_HARDWARE_DEBUG_API
     Arch_initBreakpointContext(context);
 #endif
 }

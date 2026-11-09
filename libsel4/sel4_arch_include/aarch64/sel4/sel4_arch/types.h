@@ -8,16 +8,6 @@
 
 #include <sel4/simple_types.h>
 
-typedef seL4_Uint64 seL4_Word;
-typedef seL4_Word seL4_CPtr;
-typedef seL4_Word seL4_NodeId;
-typedef seL4_Word seL4_PAddr;
-typedef seL4_Word seL4_Domain;
-
-typedef seL4_CPtr seL4_ARM_PageUpperDirectory;
-typedef seL4_CPtr seL4_ARM_PageGlobalDirectory;
-/* whether the VSpace refers to a PageUpperDirectory or PageGlobalDirectory directly
- * depends on the physical address size */
 typedef seL4_CPtr seL4_ARM_VSpace;
 
 typedef struct seL4_UserContext_ {
@@ -28,3 +18,8 @@ typedef struct seL4_UserContext_ {
     /* Thread ID registers */
     seL4_Word tpidr_el0, tpidrro_el0;
 } seL4_UserContext;
+
+typedef struct seL4_ARM_SMCContext_ {
+    /* register arguments */
+    seL4_Word x0, x1, x2, x3, x4, x5, x6, x7;
+} seL4_ARM_SMCContext;

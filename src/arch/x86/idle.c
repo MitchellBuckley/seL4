@@ -7,13 +7,6 @@
 #include <config.h>
 #include <api/debug.h>
 
-void idle_thread(void)
-{
-    while (1) {
-        asm volatile("hlt");
-    }
-}
-
 /** DONT_TRANSLATE */
 void VISIBLE halt(void)
 {

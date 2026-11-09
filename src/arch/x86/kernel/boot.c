@@ -24,7 +24,7 @@
 #include <plat/machine/intel-vtd.h>
 
 #define MAX_RESERVED 1
-BOOT_DATA static region_t reserved[MAX_RESERVED];
+BOOT_BSS static region_t reserved[MAX_RESERVED];
 
 /* functions exactly corresponding to abstract specification */
 
@@ -67,30 +67,18 @@ BOOT_CODE static void init_irqs(cap_t root_cnode_cap)
     write_slot(SLOT_PTR(pptr_of_cap(root_cnode_cap), seL4_CapIRQControl), cap_irq_control_cap_new());
 }
 
-BOOT_CODE static bool_t create_untypeds(
-    cap_t root_cnode_cap,
-    region_t boot_mem_reuse_reg)
+BOOT_CODE static bool_t arch_init_freemem(p_region_t ui_p_reg,
+                                          v_region_t it_v_reg,
+                                          mem_p_regs_t *mem_p_regs,
+                                          word_t extra_bi_size_bits)
 {
-    seL4_SlotPos     slot_pos_before;
-    seL4_SlotPos     slot_pos_after;
-
-    slot_pos_before = ndks_boot.slot_pos_cur;
-    create_device_untypeds(root_cnode_cap, slot_pos_before);
-    create_kernel_untypeds(root_cnode_cap, boot_mem_reuse_reg, slot_pos_before);
-
-    slot_pos_after = ndks_boot.slot_pos_cur;
-    ndks_boot.bi_frame->untyped = (seL4_SlotRegion) {
-        slot_pos_before, slot_pos_after
-    };
-    return true;
-}
-
-BOOT_CODE static void arch_init_freemem(p_region_t ui_p_reg, v_region_t v_reg,
-                                        mem_p_regs_t *mem_p_regs, word_t extra_bi_size_bits)
-{
-    ui_p_reg.start = 0;
+    // Extend the reserved region down to include the base of the kernel image.
+    // KERNEL_ELF_PADDR_BASE is the lowest physical load address used
+    // in the x86 linker script.
+    ui_p_reg.start = KERNEL_ELF_PADDR_BASE;
     reserved[0] = paddr_to_pptr_reg(ui_p_reg);
-    init_freemem(mem_p_regs->count, mem_p_regs->list, MAX_RESERVED, reserved, v_reg, extra_bi_size_bits);
+    return init_freemem(mem_p_regs->count, mem_p_regs->list, MAX_RESERVED,
+                        reserved, it_v_reg, extra_bi_size_bits);
 }
 
 /* This function initialises a node's kernel state. It does NOT initialise the CPU. */
@@ -99,7 +87,6 @@ BOOT_CODE bool_t init_sys_state(
     cpu_id_t      cpu_id,
     mem_p_regs_t  *mem_p_regs,
     ui_info_t     ui_info,
-    p_region_t    boot_mem_reuse_p_reg,
     /* parameters below not modeled in abstract specification */
     uint32_t      num_drhu,
     paddr_t      *drhu_list,
@@ -117,7 +104,7 @@ BOOT_CODE bool_t init_sys_state(
     cap_t         it_vspace_cap;
     cap_t         it_ap_cap;
     cap_t         ipcbuf_cap;
-    word_t        extra_bi_size = sizeof(seL4_BootInfoHeader);
+    word_t        extra_bi_size = 0;
     pptr_t        extra_bi_offset = 0;
     uint32_t      tsc_freq;
     create_frames_of_region_ret_t create_frames_ret;
@@ -125,7 +112,6 @@ BOOT_CODE bool_t init_sys_state(
 
     /* convert from physical addresses to kernel pptrs */
     region_t ui_reg             = paddr_to_pptr_reg(ui_info.p_reg);
-    region_t boot_mem_reuse_reg = paddr_to_pptr_reg(boot_mem_reuse_p_reg);
 
     /* convert from physical addresses to userland vptrs */
     v_region_t ui_v_reg;
@@ -135,7 +121,7 @@ BOOT_CODE bool_t init_sys_state(
 
     ipcbuf_vptr = ui_v_reg.end;
     bi_frame_vptr = ipcbuf_vptr + BIT(PAGE_BITS);
-    extra_bi_frame_vptr = bi_frame_vptr + BIT(PAGE_BITS);
+    extra_bi_frame_vptr = bi_frame_vptr + BIT(seL4_BootInfoFrameBits);
 
     if (vbe->vbeMode != -1) {
         extra_bi_size += sizeof(seL4_X86_BootInfo_VBE);
@@ -156,7 +142,7 @@ BOOT_CODE bool_t init_sys_state(
 
     /* The region of the initial thread is the user image + ipcbuf and boot info */
     it_v_reg.start = ui_v_reg.start;
-    it_v_reg.end = ROUND_UP(extra_bi_frame_vptr + BIT(extra_bi_size_bits), PAGE_BITS);
+    it_v_reg.end = ROUND_UP(extra_bi_frame_vptr + (extra_bi_size_bits > 0 ? BIT(extra_bi_size_bits) : 0), PAGE_BITS);
 #ifdef CONFIG_IOMMU
     /* calculate the number of io pts before initialising memory */
     if (!vtd_init_num_iopts(num_drhu)) {
@@ -164,7 +150,10 @@ BOOT_CODE bool_t init_sys_state(
     }
 #endif /* CONFIG_IOMMU */
 
-    arch_init_freemem(ui_info.p_reg, it_v_reg, mem_p_regs, extra_bi_size_bits);
+    if (!arch_init_freemem(ui_info.p_reg, it_v_reg, mem_p_regs, extra_bi_size_bits)) {
+        printf("ERROR: free memory management initialization failed\n");
+        return false;
+    }
 
     /* create the root cnode */
     root_cnode_cap = create_root_cnode();
@@ -187,7 +176,7 @@ BOOT_CODE bool_t init_sys_state(
     populate_bi_frame(0, ksNumCPUs, ipcbuf_vptr, extra_bi_size);
     region_t extra_bi_region = {
         .start = rootserver.extra_bi,
-        .end = rootserver.extra_bi + BIT(extra_bi_size_bits)
+        .end = rootserver.extra_bi + (extra_bi_size_bits > 0 ? BIT(extra_bi_size_bits) : 0)
     };
 
     /* populate vbe info block */
@@ -236,12 +225,6 @@ BOOT_CODE bool_t init_sys_state(
         *(uint32_t *)(extra_bi_region.start + extra_bi_offset) = tsc_freq;
         extra_bi_offset += 4;
     }
-
-    /* provde a chunk for any leftover padding in the extended boot info */
-    seL4_BootInfoHeader padding_header;
-    padding_header.id = SEL4_BOOTINFO_HEADER_PADDING;
-    padding_header.len = (extra_bi_region.end - extra_bi_region.start) - extra_bi_offset;
-    *(seL4_BootInfoHeader *)(extra_bi_region.start + extra_bi_offset) = padding_header;
 
 #ifdef CONFIG_KERNEL_MCS
     /* set up sched control for each core */
@@ -308,9 +291,13 @@ BOOT_CODE bool_t init_sys_state(
 #endif
 
     /* create the idle thread */
-    if (!create_idle_thread()) {
-        return false;
-    }
+    create_idle_thread();
+
+    /* copy i387 FPU initial state from FPU */
+    saveFpuState(NODE_STATE(ksIdleThread));
+    x86KSnullFpuState = NODE_STATE(ksIdleThread)->tcbArch.tcbContext.fpuState;
+    /* Check that we can load it: */
+    loadFpuState(NODE_STATE(ksIdleThread));
 
     /* create the initial thread */
     tcb_t *initial = create_initial_thread(root_cnode_cap,
@@ -340,7 +327,7 @@ BOOT_CODE bool_t init_sys_state(
 #endif
 
     /* create all of the untypeds. Both devices and kernel window memory */
-    if (!create_untypeds(root_cnode_cap, boot_mem_reuse_reg)) {
+    if (!create_untypeds(root_cnode_cap)) {
         return false;
     }
 

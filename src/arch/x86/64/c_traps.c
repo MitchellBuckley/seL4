@@ -14,7 +14,7 @@
 #include <api/syscall.h>
 
 #ifdef CONFIG_VTX
-static void NORETURN vmlaunch_failed(word_t failInvalid, word_t failValid)
+static void NORETURN USED vmlaunch_failed(word_t failInvalid, word_t failValid)
 {
     NODE_LOCK_SYS;
 
@@ -31,105 +31,178 @@ static void NORETURN vmlaunch_failed(word_t failInvalid, word_t failValid)
     restore_user_context();
 }
 
-static void NORETURN restore_vmx(void)
+static void NORETURN restore_vmx(tcb_t *cur_thread, vcpu_t *vcpu)
 {
     restoreVMCS();
-    tcb_t *cur_thread = NODE_STATE(ksCurThread);
 #ifdef CONFIG_HARDWARE_DEBUG_API
     /* Do not support breakpoints in VMs, so just disable all breakpoints */
     loadAllDisabledBreakpointState(cur_thread);
 #endif
-    if (cur_thread->tcbArch.tcbVCPU->launched) {
-        /* attempt to do a vmresume */
-        asm volatile(
-            // Set our stack pointer to the top of the tcb so we can efficiently pop
-            "movq %[reg], %%rsp\n"
-            "popq %%rax\n"
-            "popq %%rbx\n"
-            "popq %%rcx\n"
-            "popq %%rdx\n"
-            "popq %%rsi\n"
-            "popq %%rdi\n"
-            "popq %%rbp\n"
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    vcpu_restore_guest_msrs(vcpu);
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
+
+    /* attempt to do a vmlaunch/vmresume */
+    asm volatile(
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+        // Save host's GS, Shadow GS, and FS
+        "mov $0xC0000101, %%ecx\n"
+        "rdmsr\n"
+        "shl $0x20,%%rdx\n"
+        "or %%rdx, %%rax\n"
+        "mov %%rax, %%r11\n" // R11 has GS
+        "swapgs\n"
+        "rdmsr\n"
+        "shl $0x20,%%rdx\n"
+        "or %%rdx,%%rax\n"
+        "mov %%rax, %%r12\n" // R12 has Shadow GS
+        "mov $0xC0000100, %%ecx\n"
+        "rdmsr\n"
+        "shl $0x20,%%rdx\n"
+        "or %%rdx, %%rax\n"
+        "mov %%rax, %%r13\n" // R13 has FS
+        "movq %[host_msr], %%rsp\n" // host_gs
+        "pushq %%r13\n"
+        "pushq %%r12\n"
+        "pushq %%r11\n"
+
+        // Restore guest's GS and Shadow GS
+        "mov $0xC0000101, %%ecx\n"
+        "swapgs\n"
+        "movq %[guest_msr], %%rsp\n" // guest_gs
+        "popq %%rax\n"       // GS
+        "mov %%rax,%%rdx\n"
+        "shr $0x20,%%rdx\n"
+        "wrmsr\n"
+        "swapgs\n"
+        "popq %%rax\n"       // Shadow GS
+        "mov %%rax,%%rdx\n"
+        "shr $0x20,%%rdx\n"
+        "wrmsr\n"
+        "swapgs\n"
+        "mov $0xC0000100, %%ecx\n"
+        "popq %%rax\n"       // FS
+        "mov %%rax,%%rdx\n"
+        "shr $0x20,%%rdx\n"
+        "wrmsr\n"
+        "movq %[guest_regs], %%rsp\n"
+#else /* not CONFIG_X86_64_VTX_64BIT_GUESTS */
+        // Set our stack pointer to the top of the tcb so we can efficiently pop
+        "movq %[guest_regs], %%rsp\n"
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
+        "cmpq $0x1, (%[launched])\n" // is the VM launched already?
+        "jne launch\n"
+        "popq %%rax\n"
+        "popq %%rbx\n"
+        "popq %%rcx\n"
+        "popq %%rdx\n"
+        "popq %%rsi\n"
+        "popq %%rdi\n"
+        "popq %%rbp\n"
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+        "popq %%r8\n"
+        "popq %%r9\n"
+        "popq %%r10\n"
+        "popq %%r11\n"
+        "popq %%r12\n"
+        "popq %%r13\n"
+        "popq %%r14\n"
+        "popq %%r15\n"
+#else /* not CONFIG_X86_64_VTX_64BIT_GUESTS */
 #ifdef ENABLE_SMP_SUPPORT
-            "swapgs\n"
+        "swapgs\n"
 #endif
-            // Now do the vmresume
-            "vmresume\n"
-            "setb %%al\n"
-            "sete %%bl\n"
-            "movzx %%al, %%rdi\n"
-            "movzx %%bl, %%rsi\n"
-            // if we get here we failed
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
+        "vmresume\n" // yes, do the vmresume
+        "jmp done\n"
+
+        "launch:\n"
+        "popq %%rax\n"
+        "popq %%rbx\n"
+        "popq %%rcx\n"
+        "popq %%rdx\n"
+        "popq %%rsi\n"
+        "popq %%rdi\n"
+        "popq %%rbp\n"
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+        "popq %%r8\n"
+        "popq %%r9\n"
+        "popq %%r10\n"
+        "popq %%r11\n"
+        "popq %%r12\n"
+        "popq %%r13\n"
+        "popq %%r14\n"
+        "popq %%r15\n"
+#else /* not CONFIG_X86_64_VTX_64BIT_GUESTS */
 #ifdef ENABLE_SMP_SUPPORT
-            "swapgs\n"
-            "movq %%gs:%c[stack_offset], %%rsp\n"
+        "swapgs\n"
+#endif
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
+        "vmlaunch\n" // no, do the vmlaunch
+
+        "done:\n"
+        "setb %%al\n"
+        "sete %%bl\n"
+        "movzx %%al, %%rdi\n"
+        "movzx %%bl, %%rsi\n"
+        // if we get here we failed
+
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+        // Restore host's GS, Shadow GS, and FS
+        "sub $0xA8, %%rsp\n" // 15 * 8 (regs) + 3 * 8 (guest_msr) + 3 * 8 (host_msr)
+        "mov $0xC0000101, %%ecx\n"
+        "pop %%rax\n"
+        "movq %%rax, %%rdx\n"
+        "shr $0x20, %%rdx\n"
+        "wrmsr\n" // GS
+        "swapgs\n"
+        "pop %%rax\n"
+        "movq %%rax, %%rdx\n"
+        "shr $0x20, %%rdx\n"
+        "wrmsr\n" // Shadow GS
+        "mov $0xC0000100, %%ecx\n"
+        "pop %%rax\n"
+        "movq %%rax, %%rdx\n"
+        "shr $0x20, %%rdx\n"
+        "wrmsr\n" // FS
+
+#else /* not CONFIG_X86_64_VTX_64BIT_GUESTS */
+#ifdef ENABLE_SMP_SUPPORT
+        "swapgs\n"
+        "movq %%gs:%c[stack_offset], %%rsp\n"
 #else
-            "leaq kernel_stack_alloc + %c[stack_size], %%rsp\n"
+        "leaq kernel_stack_alloc + %c[stack_size], %%rsp\n"
 #endif
-            "movq %[failed], %%rax\n"
-            "jmp *%%rax\n"
-            :
-            : [reg]"r"(&cur_thread->tcbArch.tcbVCPU->gp_registers[VCPU_EAX]),
-            [failed]"i"(&vmlaunch_failed),
-            [stack_size]"i"(BIT(CONFIG_KERNEL_STACK_BITS))
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
+        "leaq vmlaunch_failed(%%rip), %%rax\n"
+        "jmp *%%rax\n"
+        :
+        : [guest_regs]"r"(vcpu->gp_registers),
+        [launched]"r"(&vcpu->launched),
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+        [stack_size]"i"(BIT(CONFIG_KERNEL_STACK_BITS)),
+        [guest_msr]"r"(vcpu->guest_msr_registers),
+        [host_msr]"r"(&vcpu->host_msr_registers[n_vcpu_msr_register])
+#else /* not CONFIG_X86_64_VTX_64BIT_GUESTS */
+        [stack_size]"i"(BIT(CONFIG_KERNEL_STACK_BITS))
 #ifdef ENABLE_SMP_SUPPORT
-            , [stack_offset]"i"(OFFSETOF(nodeInfo_t, stackTop))
+        , [stack_offset]"i"(OFFSETOF(nodeInfo_t, stackTop))
 #endif
-            // Clobber memory so the compiler is forced to complete all stores
-            // before running this assembler
-            : "memory"
-        );
-    } else {
-        /* attempt to do a vmlaunch */
-        asm volatile(
-            // Set our stack pointer to the top of the tcb so we can efficiently pop
-            "movq %[reg], %%rsp\n"
-            "popq %%rax\n"
-            "popq %%rbx\n"
-            "popq %%rcx\n"
-            "popq %%rdx\n"
-            "popq %%rsi\n"
-            "popq %%rdi\n"
-            "popq %%rbp\n"
-#ifdef ENABLE_SMP_SUPPORT
-            "swapgs\n"
-#endif
-            // Now do the vmresume
-            "vmlaunch\n"
-            // if we get here we failed
-            "setb %%al\n"
-            "sete %%bl\n"
-            "movzx %%al, %%rdi\n"
-            "movzx %%bl, %%rsi\n"
-#ifdef ENABLE_SMP_SUPPORT
-            "swapgs\n"
-            "movq %%gs:%c[stack_offset], %%rsp\n"
-#else
-            "leaq kernel_stack_alloc + %c[stack_size], %%rsp\n"
-#endif
-            "movq %[failed], %%rax\n"
-            "jmp *%%rax\n"
-            :
-            : [reg]"r"(&cur_thread->tcbArch.tcbVCPU->gp_registers[VCPU_EAX]),
-            [failed]"i"(&vmlaunch_failed),
-            [stack_size]"i"(BIT(CONFIG_KERNEL_STACK_BITS))
-#ifdef ENABLE_SMP_SUPPORT
-            , [stack_offset]"i"(OFFSETOF(nodeInfo_t, stackTop))
-#endif
-            // Clobber memory so the compiler is forced to complete all stores
-            // before running this assembler
-            : "memory"
-        );
-    }
+#endif /* CONFIG_X86_64_VTX_64BIT_GUESTS */
+        // Clobber memory so the compiler is forced to complete all stores
+        // before running this assembler. Leave rbx, r8, r9 and r10 not clobbered
+        // so that the inputs get pinned to those general purpose registers.
+        : "memory", "cc", "rax", "rcx", "rdx", "r11", "r12", "r13", "r14", "r15"
+    );
     UNREACHABLE();
 }
 #endif
 
 void VISIBLE NORETURN restore_user_context(void)
 {
-    NODE_UNLOCK_IF_HELD;
     c_exit_hook();
+
+    NODE_UNLOCK_IF_HELD;
 
     /* we've now 'exited' the kernel. If we have a pending interrupt
      * we should 'enter' it again */
@@ -152,11 +225,14 @@ void VISIBLE NORETURN restore_user_context(void)
     tcb_t *cur_thread = NODE_STATE(ksCurThread);
     word_t *irqstack = x64KSIRQStack[CURRENT_CPU_INDEX()];
 #ifdef CONFIG_VTX
+    vcpu_t *vcpu = cur_thread->tcbArch.tcbVCPU;
     if (thread_state_ptr_get_tsType(&cur_thread->tcbState) == ThreadState_RunningVM) {
-        restore_vmx();
+        vcpu_fpu_to_guest(cur_thread, vcpu);
+        restore_vmx(cur_thread, vcpu);
+    } else if (vcpu) {
+        vcpu_fpu_to_host(cur_thread, vcpu);
     }
 #endif
-    lazyFPURestore(cur_thread);
 
 #ifdef CONFIG_HARDWARE_DEBUG_API
     restore_user_debug_context(cur_thread);
@@ -183,7 +259,7 @@ void VISIBLE NORETURN restore_user_context(void)
             /* if we are using the SKIM window then we are trying to hide kernel state from
              * the user in the case of Meltdown where the kernel region is effectively readable
              * by the user. To prevent a storage channel across threads through the irq stack,
-             * which is idirectly controlled by the user, we need to clear the stack. We perform
+             * which is indirectly controlled by the user, we need to clear the stack. We perform
              * this here since when we return *from* an interrupt we must use this stack and
              * cannot clear it. This means if we restore from interrupt, then enter from a syscall
              * and switch to a different thread we must either on syscall entry, or before leaving
@@ -243,12 +319,7 @@ void VISIBLE NORETURN restore_user_context(void)
                 // More register but we can ignore and are done restoring
                 // enable interrupt disabled by sysenter
                 "sti\n"
-                /* Return to user.
-                 *
-                 * SYSEXIT  0F 35     ; Return to compatibility mode from fast system call.
-                 * SYSEXITQ 48 0F 35  ; Return to 64-bit mode from fast system call.
-                 * */
-                "sysexitq\n"
+                SYSEXITQ "\n"
                 :
                 : "r"(&cur_thread->tcbArch.tcbContext.registers[RDI]),
 #if defined(ENABLE_SMP_SUPPORT) && defined(CONFIG_KERNEL_SKIM_WINDOW)

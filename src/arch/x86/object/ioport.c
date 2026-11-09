@@ -106,7 +106,6 @@ exception_t decodeX86PortControlInvocation(
     cptr_t cptr,
     cte_t *slot,
     cap_t cap,
-    extra_caps_t excaps,
     word_t *buffer
 )
 {
@@ -124,7 +123,7 @@ exception_t decodeX86PortControlInvocation(
         return EXCEPTION_SYSCALL_ERROR;
     }
 
-    if (length < 4 || excaps.excaprefs[0] == NULL) {
+    if (length < 4 || current_extra_caps.excaprefs[0] == NULL) {
         userError("IOPortControl: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
@@ -135,7 +134,7 @@ exception_t decodeX86PortControlInvocation(
     index = getSyscallArg(2, buffer);
     depth = getSyscallArg(3, buffer);
 
-    cnodeCap = excaps.excaprefs[0]->cap;
+    cnodeCap = current_extra_caps.excaprefs[0]->cap;
 
     if (last_port < first_port) {
         userError("IOPortControl: Last port must be > first port.");
@@ -170,7 +169,8 @@ exception_t decodeX86PortControlInvocation(
 static exception_t invokeX86PortIn(word_t invLabel, uint16_t port, bool_t call)
 {
     uint32_t res;
-    word_t len;
+    tcb_t *thread;
+    thread = NODE_STATE(ksCurThread);
 
     switch (invLabel) {
     case X86IOPortIn8:
@@ -185,31 +185,13 @@ static exception_t invokeX86PortIn(word_t invLabel, uint16_t port, bool_t call)
     }
 
     if (call) {
-        setRegister(NODE_STATE(ksCurThread), badgeRegister, 0);
-
-        if (n_msgRegisters < 1) {
-            word_t *ipcBuffer;
-            ipcBuffer = lookupIPCBuffer(true, NODE_STATE(ksCurThread));
-            if (ipcBuffer != NULL) {
-                ipcBuffer[1] = res;
-                len = 1;
-            } else {
-                len = 0;
-            }
-        } else {
-            setRegister(NODE_STATE(ksCurThread), msgRegisters[0], res);
-            len = 1;
-        }
-
-        setRegister(NODE_STATE(ksCurThread), msgInfoRegister,
-                    wordFromMessageInfo(seL4_MessageInfo_new(0, 0, 0, len)));
+        word_t *ipcBuffer = lookupIPCBuffer(true, thread);
+        setRegister(thread, badgeRegister, 0);
+        unsigned int length = setMR(thread, ipcBuffer, 0, res);
+        setRegister(thread, msgInfoRegister, wordFromMessageInfo(
+                        seL4_MessageInfo_new(0, 0, 0, length)));
     }
-    // Prevent handleInvocation from attempting to complete the 'call' with an empty
-    // message (via replyFromKernel_success_empty) by forcing the thread state to
-    // be running. This prevents our stored message we just created from being
-    // overwritten.
     setThreadState(NODE_STATE(ksCurThread), ThreadState_Running);
-
     return EXCEPTION_NONE;
 }
 
@@ -236,12 +218,11 @@ exception_t decodeX86PortInvocation(
     cptr_t cptr,
     cte_t *slot,
     cap_t cap,
-    extra_caps_t excaps,
     bool_t call,
     word_t *buffer
 )
 {
-    exception_t ret;
+    exception_t ret = EXCEPTION_NONE;
 
     if (invLabel == X86IOPortIn8 || invLabel == X86IOPortIn16 || invLabel == X86IOPortIn32) {
         if (length < 1) {
@@ -282,7 +263,7 @@ exception_t decodeX86PortInvocation(
            passed to invokeX86PortOut. Whilst invokeX86PortOut will ignore any extra data and
            cast down to the correct word size removing the extra here is currently relied upon
            for verification */
-        uint32_t data;
+        uint32_t data = 0;
 
         switch (invLabel) {
         case X86IOPortOut8:

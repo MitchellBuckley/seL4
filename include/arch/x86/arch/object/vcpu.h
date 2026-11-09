@@ -232,6 +232,13 @@ typedef uint16_t vpid_t;
 #ifdef CONFIG_VTX
 #define VTX_TERNARY(vtx, nonvtx) vtx
 
+#define VMXON_REGION_SIZE 4096
+
+struct vmxon_region {
+    uint32_t revision;
+    char data[VMXON_REGION_SIZE - sizeof(uint32_t)];
+} ALIGN(VMXON_REGION_SIZE);
+
 enum vcpu_gp_register {
     VCPU_EAX = 0,
     VCPU_EBX,
@@ -240,11 +247,39 @@ enum vcpu_gp_register {
     VCPU_ESI,
     VCPU_EDI,
     VCPU_EBP,
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    VCPU_R8,
+    VCPU_R9,
+    VCPU_R10,
+    VCPU_R11,
+    VCPU_R12,
+    VCPU_R13,
+    VCPU_R14,
+    VCPU_R15,
+#endif
     n_vcpu_gp_register,
-    /* We need to define a sentinal value to detect ESP that is strictly distinct
+    /* We need to define a sentinel value to detect ESP that is strictly distinct
      * from any of our other GP register indexes, so put that here */
     VCPU_ESP,
 };
+
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+enum vcpu_guest_syscall_register {
+    VCPU_STAR = 0,
+    VCPU_CSTAR,
+    VCPU_LSTAR,
+    VCPU_SYSCALL_MASK,
+    n_vcpu_guest_syscall_register,
+};
+
+enum vcpu_msr_register {
+    VCPU_GS = 0,
+    VCPU_SHADOW_GS,
+    VCPU_FS,
+    n_vcpu_msr_register,
+};
+
+#endif
 
 typedef enum vcpu_gp_register vcpu_gp_register_t;;
 
@@ -259,16 +294,22 @@ struct vcpu {
     /* Place the fpu state here so that it is aligned */
     user_fpu_state_t fpuState;
 
+    /* Arrays for guest and hosts MSR registers */
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    word_t host_msr_registers[n_vcpu_msr_register];
+    word_t guest_msr_registers[n_vcpu_msr_register];
+#endif
+
     /* General purpose registers that we have to save and restore as they
      * are not part of the vmcs */
     word_t gp_registers[n_vcpu_gp_register];
-#if defined(ENABLE_SMP_SUPPORT) && defined(CONFIG_ARCH_IA32)
-    word_t kernelSP;
-#endif
 
     /* TCB associated with this VCPU. */
     struct tcb *vcpuTCB;
     bool_t launched;
+
+    /* True if the FPU is used by the VCPU */
+    bool_t fpu_active;
 
     /* Currently assigned VPID */
     vpid_t vpid;
@@ -293,6 +334,10 @@ struct vcpu {
     word_t cached_cr0_shadow;
     word_t cached_cr0_mask;
     word_t cached_cr0;
+
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+    word_t syscall_registers[n_vcpu_guest_syscall_register];
+#endif
 
     /* Last used EPT root */
     word_t last_ept_root;
@@ -326,7 +371,7 @@ exception_t decodeX86VCPUInvocation(
     cptr_t cptr,
     cte_t *slot,
     cap_t cap,
-    extra_caps_t excaps,
+    bool_t call,
     word_t *buffer
 );
 
@@ -339,6 +384,8 @@ void vcpu_sysvmenter_reply_to_user(tcb_t *tcb);
 bool_t vtx_init(void);
 exception_t handleVmexit(void);
 exception_t handleVmEntryFail(void);
+void vcpu_fpu_to_guest(tcb_t *tcb, vcpu_t *vcpu);
+void vcpu_fpu_to_host(tcb_t *tcb, vcpu_t *vcpu);
 void restoreVMCS(void);
 void clearCurrentVCPU(void);
 
@@ -350,6 +397,11 @@ void invept(ept_pml4e_t *ept_pml4);
 
 /* Removes any IO port mappings that have been cached for the given VPID */
 void clearVPIDIOPortMappings(vpid_t vpid, uint16_t first, uint16_t last);
+
+#ifdef CONFIG_X86_64_VTX_64BIT_GUESTS
+void vcpu_restore_guest_msrs(vcpu_t *vcpu);
+void vcpu_restore_host_msrs(void);
+#endif
 
 static inline word_t vmread(word_t field)
 {

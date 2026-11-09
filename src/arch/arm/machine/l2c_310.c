@@ -1,5 +1,6 @@
 /*
  * Copyright 2014, General Dynamics C4 Systems
+ * Copyright 2020, HENSOLDT Cyber GmbH
  *
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -270,13 +271,15 @@ BOOT_CODE void initL2Cache(void)
                | CTRL_AUX_ASSOCIATIVITY_16WAY
                | CTRL_AUS_REPLPOLICY_RROBIN;
 
-#if defined(CONFIG_PLAT_EXYNOS4) || defined(CONFIG_PLAT_IMX6) || defined(CONFIG_PLAT_ZYNQ7000) || defined(CONFIG_PLAT_ALLWINNERA20)
+#if defined(CONFIG_PLAT_IMX6SX)
+    aux |= CTRL_AUX_WAYSIZE_16K;
+#elif defined(CONFIG_PLAT_IMX6) || defined(CONFIG_PLAT_ZYNQ7000) || defined(CONFIG_PLAT_ALLWINNERA20)
     aux |= CTRL_AUX_WAYSIZE_64K;
 #elif defined(OMAP4)
     aux |= CTRL_AUX_WAYSIZE_32K;
-#else /* ! (EXYNOS4 || OMAP4 || IMX6) */
+#else /* ! (OMAP4 || IMX6 || ZYNQ7000 || ALLWINNERA20) */
 #error Unknown platform for L2C-310
-#endif /* EXYNOS4 || OMAP4 || IMX6 */
+#endif /* OMAP4 || IMX6 || ZYNQ7000 || ALLWINNERA20 */
 
 #ifdef TI_MSHIELD
     /* Access secure registers through Security Middleware Call */
@@ -337,6 +340,9 @@ BOOT_CODE void initL2Cache(void)
     /* Direct register access */
     l2cc->control.control |= CTRL_CTRL_EN;
 #endif /* TI_MSHIELD */
+    /* Guarantee that the setACTLR() doesn't start executing until the completion
+     * of the l2cc register updates */
+    dsb();
 
 #if defined(CONFIG_ARM_CORTEX_A9) && defined(CONFIG_ENABLE_A9_PREFETCHER)
     /* Set bit 1 in the ACTLR, which on the cortex-a9 is the l2 prefetch enable
@@ -349,19 +355,30 @@ BOOT_CODE void initL2Cache(void)
 
 static inline void L2_cacheSync(void)
 {
+    /* Avoid normal memory writes being reordered with device memory writes */
     dmb();
     l2cc->maintenance.cache_sync = 0;
     while (l2cc->maintenance.cache_sync & MAINTENANCE_PENDING);
+    /* Wait till the L2 cache operation has completed and avoid later memoy
+     * operations being reordered to before this point */
+    dsb();
 }
 
+/*
+ * Errata 727915 applies for PL310 revisions r2p0, r3p0, fixed in r3p1.
+ * i.MX6 has r3p1, so is not affected.
+ * If a new write arrives during the clean & invalidate operation,
+ * there is a small chance it will get lost.
+ * The same is true when doing separate clean and invalidate operations,
+ * hence that is not a proper work-around and worse than the errata.
+ */
 void plat_cleanInvalidateL2Cache(void)
 {
     if (!config_set(CONFIG_DEBUG_DISABLE_L2_CACHE)) {
-        l2cc->maintenance.clean_way = 0xffff;
-        while (l2cc->maintenance.clean_way);
-        L2_cacheSync();
-        l2cc->maintenance.inv_way = 0xffff;
-        while (l2cc->maintenance.inv_way);
+        /* Avoid normal memory writes being reordered with device memory writes */
+        dmb();
+        l2cc->maintenance.clean_inv_way = 0xffff;
+        while (l2cc->maintenance.clean_inv_way);
         L2_cacheSync();
     }
 }
@@ -369,6 +386,8 @@ void plat_cleanInvalidateL2Cache(void)
 void plat_cleanCache(void)
 {
 #ifndef CONFIG_DEBUG_DISABLE_L2_CACHE
+    /* Avoid normal memory writes being reordered with device memory writes */
+    dmb();
     /* Clean by way. */
     l2cc->maintenance.clean_way = 0xffff;
     while (l2cc->maintenance.clean_way & 0xffff);
@@ -382,6 +401,8 @@ void plat_cleanL2Range(paddr_t start, paddr_t end)
     /* Documentation specifies this as the only possible line size */
     assert(((l2cc->id.cache_type >> 12) & 0x3) == 0x0);
 
+    /* Avoid normal memory writes being reordered with device memory writes */
+    dmb();
     for (start = L2_LINE_START(start);
          start != L2_LINE_START(end + L2_LINE_SIZE);
          start += L2_LINE_SIZE) {
@@ -398,9 +419,10 @@ void plat_invalidateL2Range(paddr_t start, paddr_t end)
     /* Documentation specifies this as the only possible line size */
     assert(((l2cc->id.cache_type >> 12) & 0x3) == 0x0);
 
+    /* Avoid normal memory writes being reordered with device memory writes */
+    dmb();
     /* We assume that if this is a partial line that whoever is calling us
      * has already done the clean, so we just blindly invalidate all the lines */
-
     for (start = L2_LINE_START(start);
          start != L2_LINE_START(end + L2_LINE_SIZE);
          start += L2_LINE_SIZE) {
@@ -417,13 +439,12 @@ void plat_cleanInvalidateL2Range(paddr_t start, paddr_t end)
     /* Documentation specifies this as the only possible line size */
     assert(((l2cc->id.cache_type >> 12) & 0x3) == 0x0);
 
+    /* Avoid normal memory writes being reordered with device memory writes */
+    dmb();
     for (start = L2_LINE_START(start);
          start != L2_LINE_START(end + L2_LINE_SIZE);
          start += L2_LINE_SIZE) {
-        /* Work around an errata and call the clean and invalidate separately */
-        l2cc->maintenance.clean_pa = start;
-        dmb();
-        l2cc->maintenance.inv_pa = start;
+        l2cc->maintenance.clean_inv_pa = start;
         /* do not need to wait for every invalidate as 310 is atomic */
     }
     L2_cacheSync();

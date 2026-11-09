@@ -12,24 +12,37 @@
 
 static inline void arch_c_entry_hook(void)
 {
+    /* Nothing architecture specific to be done. */
 }
 
 static inline void arch_c_exit_hook(void)
 {
+    /* Nothing architecture specific to be done. */
 }
 
-void c_handle_syscall(word_t cptr, word_t msgInfo, word_t unused1, word_t unused2, word_t unused3, word_t unused4,
-                      word_t unused5, syscall_t syscall)
-VISIBLE NORETURN;
+/* ASM trap entry. */
+void NORETURN trap_entry(void);
+
+#ifdef CONFIG_KERNEL_MCS
+void c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo, word_t reply)
+#else
+void c_handle_fastpath_reply_recv(word_t cptr, word_t msgInfo)
+#endif
+VISIBLE NORETURN SECTION(".text.fastpath");
+
+void c_handle_fastpath_call(word_t cptr, word_t msgInfo)
+VISIBLE NORETURN SECTION(".text.fastpath");
+
+void c_handle_syscall(word_t cptr, word_t msgInfo, syscall_t syscall)
+VISIBLE NORETURN SECTION(".text.traps");
 
 void c_handle_interrupt(void)
-VISIBLE NORETURN;
+VISIBLE NORETURN SECTION(".text.traps");
 
 void c_handle_exception(void)
-VISIBLE NORETURN;
+VISIBLE NORETURN SECTION(".text.traps");
 
 void restore_user_context(void)
-VISIBLE NORETURN;
+VISIBLE NORETURN SECTION(".text.traps");
 
 void handle_exception(void);
-

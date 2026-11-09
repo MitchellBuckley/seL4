@@ -18,7 +18,7 @@
 /* Use this to forward interrupts to all CPUs when debugging */
 #define TARGET_CPU_ALL_ALLINT   TARGET_CPU_ALLINT(0xff)
 
-#define IRQ_SET_ALL 0xffffffff;
+#define IRQ_SET_ALL 0xffffffff
 
 #ifndef GIC_V2_DISTRIBUTOR_PPTR
 #error GIC_V2_DISTRIBUTOR_PPTR must be defined for virtual memory access to the gic distributer
@@ -34,7 +34,7 @@ volatile struct gic_cpu_iface_map *const gic_cpuiface =
     (volatile struct gic_cpu_iface_map *)(GIC_V2_CONTROLLER_PPTR);
 #endif /* GIC_CONTROLLER_PPTR */
 
-word_t active_irq[CONFIG_MAX_NUM_NODES] = {IRQ_NONE};
+word_t active_irq[CONFIG_MAX_NUM_NODES];
 
 /* Get the target id for this processor. We rely on the constraint that the registers
  * for PPI are read only and return only the current processor as the target.
@@ -111,7 +111,7 @@ BOOT_CODE static void cpu_iface_init(void)
 {
     uint32_t i;
 
-    /* For non-Exynos4, the registers are banked per CPU, need to clear them */
+    /* The registers are banked per CPU, need to clear them */
     gic_dist->enable_clr[0] = IRQ_SET_ALL;
     gic_dist->pending_clr[0] = IRQ_SET_ALL;
 
@@ -171,7 +171,19 @@ BOOT_CODE void initIRQController(void)
 
 BOOT_CODE void cpu_initLocalIRQController(void)
 {
+    active_irq[CURRENT_CPU_INDEX()] = IRQ_NONE;
     cpu_iface_init();
+}
+
+bool_t plat_SGITargetValid(word_t target)
+{
+    /* written as <= so that the term is the same as in gic_v3 for the proofs */
+    return target <= GIC_SGI_NUM_TARGETS - 1;
+}
+
+void plat_sendSGI(word_t irq, word_t target)
+{
+    gic_dist->sgi_control = (BIT(target) << (GICD_SGIR_CPUTARGETLIST_SHIFT)) | (irq << GICD_SGIR_SGIINTID_SHIFT);
 }
 
 #ifdef ENABLE_SMP_SUPPORT
@@ -179,7 +191,7 @@ BOOT_CODE void cpu_initLocalIRQController(void)
 * 25-24: target lister filter
 * 0b00 - send the ipi to the CPU interfaces specified in the CPU target list
 * 0b01 - send the ipi to all CPU interfaces except the cpu interface.
-*        that requrested teh ipi
+*        that requested the ipi
 * 0b10 - send the ipi only to the CPU interface that requested the IPI.
 * 0b11 - reserved
 *.
@@ -228,6 +240,6 @@ volatile struct gich_vcpu_ctrl_map *gic_vcpu_ctrl =
     (volatile struct gich_vcpu_ctrl_map *)(GIC_V2_VCPUCTRL_PPTR);
 #endif /* GIC_PL400_GICVCPUCTRL_PPTR */
 
-unsigned int gic_vcpu_num_list_regs;
+word_t gic_vcpu_num_list_regs;
 
 #endif /* End of CONFIG_ARM_HYPERVISOR_SUPPORT */

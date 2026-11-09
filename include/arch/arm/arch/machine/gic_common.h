@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <autoconf.h>
+#include <config.h>
 #include <stdint.h>
 #include <machine/interrupt.h>
 
@@ -22,6 +22,7 @@
 /* CPU specific IRQ's */
 #define SGI_START         0u
 #define PPI_START         16u
+#define NUM_SGIS          16u
 
 /* Shared Peripheral Interrupts */
 #define SPI_START         32u
@@ -37,25 +38,25 @@
  * The layout of IRQs into the CNode are all of PPI's for each core first, followed
  * by the global interrupts.  Examples:
  *   core: 0, irq: 12 -> index 12.
- *   core: 2, irq: 16 -> (2 * 32) + 12
+ *   core: 2, irq: 16 -> (2 * 32) + 16
  *   core: 1, irq: 33, (4 total cores) -> (4 * 32) + (33-32).
  */
 #define IRQ_IS_PPI(_irq) (HW_IRQ_IS_PPI(_irq.irq))
 #define CORE_IRQ_TO_IRQT(tgt, _irq) ((irq_t){.irq = (_irq), .target_core = (tgt)})
 #define IRQT_TO_IDX(_irq) (HW_IRQ_IS_PPI(_irq.irq) ? \
-                                 (irq.target_core)*NUM_PPI + (_irq.irq) : \
-                                 (CONFIG_MAX_NUM_NODES-1)*NUM_PPI + (_irq.irq))
+                                 (_irq.target_core) * NUM_PPI + (_irq.irq) : \
+                                 (CONFIG_MAX_NUM_NODES - 1) * NUM_PPI + (_irq.irq))
 
 #define IDX_TO_IRQT(idx) (((idx) < NUM_PPI*CONFIG_MAX_NUM_NODES) ? \
                         CORE_IRQ_TO_IRQT((idx) / NUM_PPI, (idx) - ((idx)/NUM_PPI)*NUM_PPI): \
                         CORE_IRQ_TO_IRQT(0, (idx) - (CONFIG_MAX_NUM_NODES-1)*NUM_PPI))
 #define IRQT_TO_CORE(irqt) (irqt.target_core)
 #define IRQT_TO_IRQ(irqt) (irqt.irq)
-irq_t irqInvalid = CORE_IRQ_TO_IRQT(-1, -1);
+static const irq_t irqInvalid = CORE_IRQ_TO_IRQT(-1, -1);
 
 #else
 #define IRQ_IS_PPI(irq) HW_IRQ_IS_PPI(irq)
-irq_t irqInvalid = (uint16_t) -1;
+static const irq_t irqInvalid = (uint16_t) -1;
 #endif
 
 /* Setters/getters helpers for hardware irqs */

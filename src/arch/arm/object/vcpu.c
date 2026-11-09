@@ -10,10 +10,8 @@
 
 #include <arch/object/vcpu.h>
 #include <armv/vcpu.h>
-#include <arch/machine/debug.h> /* Arch_debug[A/Di]ssociateVCPUTCB() */
-#include <arch/machine/debug_conf.h>
-#include <arch/machine/gic_v2.h>
 #include <drivers/timer/arm_generic.h>
+#include <plat/platform_gen.h> /* Ensure correct GIC header is included */
 
 BOOT_CODE void vcpu_boot_init(void)
 {
@@ -32,7 +30,7 @@ BOOT_CODE void vcpu_boot_init(void)
 static void vcpu_save(vcpu_t *vcpu, bool_t active)
 {
     word_t i;
-    unsigned int lr_num;
+    word_t lr_num;
 
     assert(vcpu);
     dsb();
@@ -41,7 +39,7 @@ static void vcpu_save(vcpu_t *vcpu, bool_t active)
     if (active) {
         vcpu_save_reg(vcpu, seL4_VCPUReg_SCTLR);
         vcpu->vgic.hcr = get_gic_vcpu_ctrl_hcr();
-        save_virt_timer(vcpu);
+        disable_virt_timer(vcpu);
     }
 
     /* Store GIC VCPU control state */
@@ -58,16 +56,9 @@ static void vcpu_save(vcpu_t *vcpu, bool_t active)
 static word_t readVCPUReg(vcpu_t *vcpu, word_t field)
 {
     if (likely(ARCH_NODE_STATE(armHSCurVCPU) == vcpu)) {
-        switch (field) {
-        case seL4_VCPUReg_SCTLR:
-            /* The SCTLR value is switched to/from hardware when we enable/disable
-             * the vcpu, not when we switch vcpus */
-            if (ARCH_NODE_STATE(armHSVCPUActive)) {
-                return getSCTLR();
-            } else {
-                return vcpu_read_reg(vcpu, field);
-            }
-        default:
+        if (vcpu_reg_saved_when_disabled(field) && !ARCH_NODE_STATE(armHSVCPUActive)) {
+            return vcpu_read_reg(vcpu, field);
+        } else {
             return vcpu_hw_read_reg(field);
         }
     } else {
@@ -78,15 +69,9 @@ static word_t readVCPUReg(vcpu_t *vcpu, word_t field)
 static void writeVCPUReg(vcpu_t *vcpu, word_t field, word_t value)
 {
     if (likely(ARCH_NODE_STATE(armHSCurVCPU) == vcpu)) {
-        switch (field) {
-        case seL4_VCPUReg_SCTLR:
-            if (ARCH_NODE_STATE(armHSVCPUActive)) {
-                setSCTLR(value);
-            } else {
-                vcpu_write_reg(vcpu, field, value);
-            }
-            break;
-        default:
+        if (vcpu_reg_saved_when_disabled(field) && !ARCH_NODE_STATE(armHSVCPUActive)) {
+            vcpu_write_reg(vcpu, field, value);
+        } else {
             vcpu_hw_write_reg(field, value);
         }
     } else {
@@ -98,7 +83,7 @@ void vcpu_restore(vcpu_t *vcpu)
 {
     assert(vcpu);
     word_t i;
-    unsigned int lr_num;
+    word_t lr_num;
     /* Turn off the VGIC */
     set_gic_vcpu_ctrl_hcr(0);
     isb();
@@ -112,16 +97,33 @@ void vcpu_restore(vcpu_t *vcpu)
     }
 
     /* restore registers */
-#ifdef CONFIG_ARCH_AARCH64
-    vcpu_restore_reg_range(vcpu, seL4_VCPUReg_TTBR0, seL4_VCPUReg_SPSR_EL1);
-#else
-    vcpu_restore_reg_range(vcpu, seL4_VCPUReg_ACTLR, seL4_VCPUReg_SPSRfiq);
-#endif
+    vcpu_restore_reg_range(vcpu, seL4_VCPURegSaveRange_start, seL4_VCPURegSaveRange_end);
     vcpu_enable(vcpu);
 }
 
 void VPPIEvent(irq_t irq)
 {
+#ifdef CONFIG_KERNEL_MCS
+    /* If the current task is currently enqueued it will not be able to
+     * correctly receive a fault IPC message. This may occur due to the
+     * budget check that happens early in the handleInterruptEntry.
+     *
+     * If the current thread does *not* have budget, as indicated by its
+     * presence in either the scheduling or release queue, this interrupt
+     * is ignored for now.
+     * As it is a level-triggered interrupt it shall be re-raised
+     * (and not lost).
+     *
+     * Additionally, if we have already received a timeout fault due to
+     * our timeslice having ended, and we have a timeout fault handler for
+     * this thread, we do not want to overwrite that with our VCPU fault.
+     */
+    if (thread_state_get_tcbQueued(NODE_STATE(ksCurThread)->tcbState) ||
+        !isSchedulable(NODE_STATE(ksCurThread))) {
+        return;
+    }
+#endif
+
     if (ARCH_NODE_STATE(armHSVCPUActive)) {
         maskInterrupt(true, irq);
         assert(irqVPPIEventIndex(irq) != VPPIEventIRQ_invalid);
@@ -141,6 +143,14 @@ void VGICMaintenance(void)
 {
     uint32_t eisr0, eisr1;
     uint32_t flags;
+
+#ifdef CONFIG_KERNEL_MCS
+    /* See VPPIEvent for details on this check. */
+    if (thread_state_get_tcbQueued(NODE_STATE(ksCurThread)->tcbState) ||
+        !isSchedulable(NODE_STATE(ksCurThread))) {
+        return;
+    }
+#endif
 
     /* We shouldn't get a VGICMaintenance interrupt while a VCPU isn't active,
      * but if one becomes pending before the VGIC is disabled we might get one
@@ -213,8 +223,8 @@ void VGICMaintenance(void)
 void vcpu_init(vcpu_t *vcpu)
 {
     armv_vcpu_init(vcpu);
-    /* GICH VCPU interface control */
-    vcpu->vgic.hcr = VGIC_HCR_EN;
+    /* GICH VCPU interface control. Trap VCPU access to Group 0 registers on GICv3. */
+    vcpu->vgic.hcr = VGIC_HCR_EN | VGIC_HCR_TALL0;
 #ifdef CONFIG_VTIMER_UPDATE_VOFFSET
     /* Virtual Timer interface */
     vcpu->virtTimer.last_pcount = 0;
@@ -233,9 +243,6 @@ void vcpu_switch(vcpu_t *new)
             ARCH_NODE_STATE(armHSVCPUActive) = true;
         } else if (unlikely(ARCH_NODE_STATE(armHSVCPUActive))) {
             /* leave the current VCPU state loaded, but disable vgic and mmu */
-#ifdef ARM_HYP_CP14_SAVE_AND_RESTORE_VCPU_THREADS
-            saveAllBreakpointState(ARCH_NODE_STATE(armHSCurVCPU)->vcpuTCB);
-#endif
             vcpu_disable(ARCH_NODE_STATE(armHSCurVCPU));
             ARCH_NODE_STATE(armHSVCPUActive) = false;
         }
@@ -255,6 +262,21 @@ static void vcpu_invalidate_active(void)
     ARCH_NODE_STATE(armHSCurVCPU) = NULL;
 }
 
+void vcpu_flush(void)
+{
+    if (ARCH_NODE_STATE(armHSCurVCPU)) {
+        vcpu_save(ARCH_NODE_STATE(armHSCurVCPU), ARCH_NODE_STATE(armHSVCPUActive));
+        vcpu_invalidate_active();
+    }
+}
+
+void vcpu_flush_if_current(tcb_t *tptr)
+{
+    if (tptr->tcbArch.tcbVCPU == ARCH_NODE_STATE(armHSCurVCPU)) {
+        vcpu_flush();
+    }
+}
+
 void vcpu_finalise(vcpu_t *vcpu)
 {
     if (vcpu->vcpuTCB) {
@@ -272,6 +294,10 @@ void associateVCPUTCB(vcpu_t *vcpu, tcb_t *tcb)
     }
     tcb->tcbArch.tcbVCPU = vcpu;
     vcpu->vcpuTCB = tcb;
+
+    if (tcb == NODE_STATE(ksCurThread)) {
+        vcpu_switch(vcpu);
+    }
 }
 
 void dissociateVCPUTCB(vcpu_t *vcpu, tcb_t *tcb)
@@ -284,9 +310,6 @@ void dissociateVCPUTCB(vcpu_t *vcpu, tcb_t *tcb)
     }
     tcb->tcbArch.tcbVCPU = NULL;
     vcpu->vcpuTCB = NULL;
-#ifdef ARM_HYP_CP14_SAVE_AND_RESTORE_VCPU_THREADS
-    Arch_debugDissociateVCPUTCB(tcb);
-#endif
 
     /* sanitize the CPSR as without a VCPU a thread should only be in user mode */
 #ifdef CONFIG_ARCH_AARCH64
@@ -302,7 +325,7 @@ exception_t invokeVCPUWriteReg(vcpu_t *vcpu, word_t field, word_t value)
     return EXCEPTION_NONE;
 }
 
-exception_t decodeVCPUWriteReg(cap_t cap, unsigned int length, word_t *buffer)
+exception_t decodeVCPUWriteReg(cap_t cap, word_t length, word_t *buffer)
 {
     word_t field;
     word_t value;
@@ -339,7 +362,7 @@ exception_t invokeVCPUReadReg(vcpu_t *vcpu, word_t field, bool_t call)
     return EXCEPTION_NONE;
 }
 
-exception_t decodeVCPUReadReg(cap_t cap, unsigned int length, bool_t call, word_t *buffer)
+exception_t decodeVCPUReadReg(cap_t cap, word_t length, bool_t call, word_t *buffer)
 {
     word_t field;
     if (length < 1) {
@@ -366,8 +389,10 @@ exception_t invokeVCPUInjectIRQ(vcpu_t *vcpu, unsigned long index, virq_t virq)
     if (likely(ARCH_NODE_STATE(armHSCurVCPU) == vcpu)) {
         set_gic_vcpu_ctrl_lr(index, virq);
 #ifdef ENABLE_SMP_SUPPORT
-    } else if (vcpu->vcpuTCB->tcbAffinity != getCurrentCPUIndex()) {
-        doRemoteOp3Arg(IpiRemoteCall_VCPUInjectInterrupt, (word_t)vcpu, index, virq.words[0],      vcpu->vcpuTCB->tcbAffinity);
+    } else if (vcpu->vcpuTCB != NULL && vcpu->vcpuTCB->tcbAffinity != getCurrentCPUIndex()) {
+        doRemoteOp3Arg(IpiRemoteCall_VCPUInjectInterrupt,
+                       (word_t)vcpu, index, virq.words[0],
+                       vcpu->vcpuTCB->tcbAffinity);
 #endif /* CONFIG_ENABLE_SMP */
     } else {
         vcpu->vgic.lr[index] = virq;
@@ -376,7 +401,7 @@ exception_t invokeVCPUInjectIRQ(vcpu_t *vcpu, unsigned long index, virq_t virq)
     return EXCEPTION_NONE;
 }
 
-exception_t decodeVCPUInjectIRQ(cap_t cap, unsigned int length, word_t *buffer)
+exception_t decodeVCPUInjectIRQ(cap_t cap, word_t length, word_t *buffer)
 {
     word_t vid, priority, group, index;
     vcpu_t *vcpu;
@@ -447,12 +472,6 @@ exception_t decodeVCPUInjectIRQ(cap_t cap, unsigned int length, word_t *buffer)
         current_syscall_error.type = seL4_RangeError;
         return EXCEPTION_SYSCALL_ERROR;
     }
-    /* LR index is in use */
-    if (virq_get_virqType(vcpu->vgic.lr[index]) == virq_virq_active) {
-        userError("VGIC List register in use.");
-        current_syscall_error.type = seL4_DeleteFirst;
-        return EXCEPTION_SYSCALL_ERROR;
-    }
     virq_t virq = virq_virq_pending_new(group, priority, 1, vid);
 
     setThreadState(NODE_STATE(ksCurThread), ThreadState_Restart);
@@ -461,18 +480,17 @@ exception_t decodeVCPUInjectIRQ(cap_t cap, unsigned int length, word_t *buffer)
 
 exception_t decodeARMVCPUInvocation(
     word_t label,
-    unsigned int length,
+    word_t length,
     cptr_t cptr,
     cte_t *slot,
     cap_t cap,
-    extra_caps_t extraCaps,
     bool_t call,
     word_t *buffer
 )
 {
     switch (label) {
     case ARMVCPUSetTCB:
-        return decodeVCPUSetTCB(cap, extraCaps);
+        return decodeVCPUSetTCB(cap);
     case ARMVCPUReadReg:
         return decodeVCPUReadReg(cap, length, call, buffer);
     case ARMVCPUWriteReg:
@@ -488,7 +506,7 @@ exception_t decodeARMVCPUInvocation(
     }
 }
 
-exception_t decodeVCPUAckVPPI(cap_t cap, unsigned int length, word_t *buffer)
+exception_t decodeVCPUAckVPPI(cap_t cap, word_t length, word_t *buffer)
 {
     vcpu_t *vcpu = VCPU_PTR(cap_vcpu_cap_get_capVCPUPtr(cap));
 
@@ -522,15 +540,15 @@ exception_t invokeVCPUAckVPPI(vcpu_t *vcpu, VPPIEventIRQ_t vppi)
     return EXCEPTION_NONE;
 }
 
-exception_t decodeVCPUSetTCB(cap_t cap, extra_caps_t extraCaps)
+exception_t decodeVCPUSetTCB(cap_t cap)
 {
     cap_t tcbCap;
-    if (extraCaps.excaprefs[0] == NULL) {
+    if (current_extra_caps.excaprefs[0] == NULL) {
         userError("VCPU SetTCB: Truncated message.");
         current_syscall_error.type = seL4_TruncatedMessage;
         return EXCEPTION_SYSCALL_ERROR;
     }
-    tcbCap  = extraCaps.excaprefs[0]->cap;
+    tcbCap  = current_extra_caps.excaprefs[0]->cap;
 
     if (cap_get_capType(tcbCap) != cap_thread_cap) {
         userError("TCB cap is not a TCB cap.");

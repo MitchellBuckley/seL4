@@ -7,9 +7,8 @@
 
 #pragma once
 
-#ifdef HAVE_AUTOCONF
-#include <autoconf.h>
-#endif
+#include <sel4/config.h>
+#include <sel4/macros.h>
 
 #define seL4_WordBits           64
 /* log 2 bits in a word */
@@ -122,9 +121,17 @@ typedef enum {
     seL4_Timeout_Data,
     seL4_Timeout_Consumed,
     seL4_Timeout_Length,
-} seL4_TimeoutMsg;
+} seL4_Timeout_Msg;
 #endif
 #endif /* __ASSEMBLER__ */
 
-/* First address in the virtual address space that is not accessible to user level */
+/* (Deprecated) First address in the virtual address space that is not accessible to user level */
 #define seL4_UserTop 0x0000003ffffff000
+
+/* Last address in the virtual address space that is accessible to user level */
+#define seL4_UserVSpaceTop (seL4_UserTop - 1)
+
+#ifdef CONFIG_ENABLE_BENCHMARKS
+/* size of kernel log buffer in bytes */
+#define seL4_LogBufferSize (LIBSEL4_BIT(20))
+#endif /* CONFIG_ENABLE_BENCHMARKS */

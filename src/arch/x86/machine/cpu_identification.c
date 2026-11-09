@@ -109,11 +109,11 @@ BOOT_CODE static void x86_cpuid_amd_identity_initialize(cpu_identity_t *ci,
         ci->display.model = original.model;
     } else {
         ci->display.family = original.family + ci->display.extended_family;
-        ci->display.family = (ci->display.extended_model << 4u) + original.model;
+        ci->display.model = (ci->display.extended_model << 4u) + original.model;
     }
 }
 
-bool_t x86_cpuid_initialize(void)
+BOOT_CODE bool_t x86_cpuid_initialize(void)
 {
     cpu_identity_t *ci = x86_cpuid_get_identity();
     struct family_model original;
@@ -125,7 +125,7 @@ bool_t x86_cpuid_initialize(void)
     /* First determine which vendor manufactured the CPU. */
     x86_cpuid_fill_vendor_string(ci);
 
-    /* Need both eax and ebx ouput values. */
+    /* Need both eax and ebx output values. */
     eax.words[0] = x86_cpuid_eax(1, 0);
     ebx.words[0] = x86_cpuid_ebx(1, 0);
 

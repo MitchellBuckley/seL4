@@ -12,38 +12,159 @@
 
 #include <arch/object/vcpu.h>
 #include <drivers/timer/arm_generic.h>
+#include <arch/machine/debug.h>
 
-/* Note that the HCR_DC for ARMv8 disables S1 translation if enabled */
+/* HCR_EL2 values common to vCPUs and native tasks.
+ * Audited against ARM ARM DDI0487M.d, D24-8919.
+ *
+ * Set at 1:
+ * - VM, virtualization enable
+ * - FMO|IMO|AMO, force on CPSR.AIF
+ * - TSC, trap SMC calls to EL2
+ * - TIDCP, trap IMPDEF sysreg access - needed as we cannot context switch them
+ * - TACR, trap ACTLR_EL1 access - needed as we should not context switch CPU
+ *   IMPDEF 'chicken bits'.
+ * - RW, controls lower-EL AArch64 vs AArch32 execution state with FEAT_AA32EL1,
+ *   or RAO/WI otherwise.
+ * - TLOR, traps accesses to LOR registers with FEAT_LOR - we do not context
+ *   switch these registers, so we must trap them. (RES0 otherwise)
+ * - TERR, traps accesses to RAS registers - we do not context switch these
+ *   registers (RES0 otherwise).
+ * - TID5, traps access to GMID_EL1 with MTE2 - current fields are RO, but the
+ *   whole register is not RO, so newer ARM versions could make RW. Trap just
+ *   in case (we also don't support MTE2).
+ * - SWIO, set/way invalidation override - redundant on ARMv8-A, where VM=1
+ *   already has this effect, but set for uniformity with ARMv7-A. Irrelevant
+ *   for native tasks, because set/way instructions are already UNDEFINED at EL0.
+ *
+ * Set at 0:
+ * - PTW, protected table walk - unneeded
+ * - VF/VI/VA, virtual FIRQ/IRQ/async pending - unneeded
+ * - FB, force broadcast - unneeded
+ * - BSU, barrier shareability upgrade - unneeded
+ * - TID0/TID1/TID2/TID3/TID4, ID register traps - accesses to registers either RO or
+ *   context switched by seL4.
+ * - TSW/TPCP/TPU, traps cache maintenance ops by set/way, to PoC,PoP, and PoU -
+ *   unneeded as these will all be clean/clean&invalidate which cannot corrupt
+ *   data; and trapping these would not prevent cache timing channels.
+ * - TDZ, traps DC ZVA operations - equivalent to zeroing memory.
+ * - HCD, traps HVC execution - unneeded, only matters without EL3, is undef
+ *   at EL0 always, and EL1 would trap to EL2 anyway.
+ * - CD/ID, forces non-cacheable instruction and data cache EL1&0/stage-2
+ *   translations - unneeded
+ * - E2H, "EL2 Host" for VHE - seL4 implements the Armv8.0 non-VHE hyp extensions
+ *   so we set to 0 to disable. RES0 when hardware does not implement.
+ * - TEA, route synchronous external aborts to EL2 (FEAT_RAS), or RES0 - seL4
+ *   does not support the RAS extensions and it should be fine for these to
+ *   be trapped at EL1, as they are synchronous and VMs can handle them.
+ * - APK, trap Pointer authentication key registers (or RES0) - 0 enables the
+ *   traps, which is safe behaviour.
+ * - API, trap pointer authentication instructions (or RES0) - 0 enables the
+ *   traps, which is safe behaviour.
+ * - NV/NV1/AT/NV2, nested virtualisation features (or RES0) - seL4 does not
+ *   support nested virtualisation.
+ * - FWB, forced writeback (or RES0) - changes how memory/cacheability attrs
+ *   are combined in stage 2 translations. not necessary
+ * - FIEN, fault injection enable for RAS (or RES0) - 0 enables the traps, which
+ *   is the safe behaviour.
+ * - GPF, granule protection faults with RME (or RES0) - 0 allows these to
+ *   route to EL1
+ * - TICAB, traps instruction cache maintenance instructions (or RES0) - unneeded
+ * - AMVOFFEN, activity monitor virtual offsets (or RES0) - unneeded, we set
+ *   CPT_EL2.TAM to 0 to disable activity monitors.
+ * - TOCU, traps cache maintenance ops to PoU (or RES0) - unneeded
+ * - EnSCXT, software context number register access (or RES0) - 0 enables the
+ *   traps, which is safe behaviour.
+ * - TTLBIS/TTLBOS, traps TLB maintenance (or RES0) - unneeded
+ * - ATA, traps memory tagging registers - 0 enables the traps, which is safe
+ *   behaviour.
+ * - DCT, controls 'tagged attribute' in stage 1 translations (MTE2) - unneeded,
+ *   seL4 does not enable the MTE extensions.
+ * - TWEDEn/TWEDEL, controls WFE instruction trap delays - unneeded, was added
+ *   as a performant-relevant optimisation.
+ * - FWB (forced write-back, Arm-v8.3+) changes PTE format, does not change
+ *   isolation behavior, only changes cache maintanance.
+ * - GPF (Armv9+), not needed. EL0 is already routed to EL2 because of TGE, EL1
+ *   can go to EL1 to be handled there.
+ *
+ *
+ * Varies:
+ * - DC, default cacheable - contrary to name, this makes CPU act as if
+ *   SCTLR_EL1.M is 0, i.e. EL1&0 stage 1 address translation disabled. Set for
+ *   native tasks, but not for vCPUs.
+ * - TWI/TWE, trap WFI/WFE at EL0 and EL1. Set for vCPUs depending on
+ *   CONFIG_DISABLE_WFI_WFE_TRAPS. Not set for native tasks. SCTLR_EL1_NATIVE
+ *   sets nTWI/nTWE, so EL0 WFI/WFE execute and the core wakes on the next
+ *   interrupt (e.g. the kernel timer). Only affects the user-level thread
+ *   itself.
+ * - TTLB, trap TLB operations - unneeded (0) for vCPUs @ EL1, conservatively
+ *   trapped for EL0 native tasks (even though they are UNDEF).
+ * - TVM/TRVM, traps writes/reads to virtual memory sysregs - for vCPUs @ EL1,
+ *   unneeded (0) and would be slow if set; conservatively trapped for EL0
+ *   native tasks (even though UNDEF).
+ * - TGE, trap EL1 general exceptions (to EL2) - used (1) for EL0 native tasks
+ *   to trap exceptions to seL4, not used EL1, not used for vCPUs.
+ */
+
 #ifdef CONFIG_DISABLE_WFI_WFE_TRAPS
-/* Trap SMC and override CPSR.AIF */
-#define HCR_COMMON ( HCR_VM | HCR_RW | HCR_AMO | HCR_IMO | HCR_FMO )
+#define HCR_MAYBE_TWI_TWE ( 0 )
 #else
-/* Trap WFI/WFE/SMC and override CPSR.AIF */
-#define HCR_COMMON ( HCR_TWI | HCR_TWE | HCR_VM | HCR_RW | HCR_AMO | HCR_IMO | HCR_FMO )
+#define HCR_MAYBE_TWI_TWE ( HCR_TWI | HCR_TWE )
 #endif
 
-/* Allow native tasks to run at EL0, but restrict access */
-#define HCR_NATIVE ( HCR_COMMON | HCR_TGE | HCR_TVM | HCR_TTLB | HCR_DC \
-                   | HCR_TAC | HCR_SWIO |  HCR_TSC | HCR_IMO | HCR_FMO | HCR_AMO)
-#define HCR_VCPU   ( HCR_COMMON | HCR_TSC)
+#define HCR_COMMON ( HCR_VM | HCR_AMO | HCR_IMO | HCR_FMO | HCR_TSC | HCR_TIDCP \
+                   | HCR_TACR | HCR_SWIO | HCR_RW | HCR_TLOR | HCR_TERR | HCR_TID5)
+
+#define HCR_NATIVE ( HCR_COMMON | HCR_DC | HCR_TTLB | HCR_TVM | HCR_TRVM | HCR_TGE )
+
+#define HCR_VCPU   ( HCR_COMMON | HCR_MAYBE_TWI_TWE )
+
+/* CPTR_EL2 value set at boot. EL0 and EL1 accesses to the following trap to EL2
+ * unless enabled explicitly later.
+ *
+ * CPTR_EL2 fields for E2H0 variant layout (HCR_EL2.E2H == 0):
+ *
+ * - TFP: trap FP and Advanced SIMD. disableTrapFpu() enables FPU later when
+ *   configured.
+ * - TZ, TSM: trap SVE and SME. The kernel does not context switch this state.
+ *   Both bits are RES1 when the feature is not implemented.
+ * - TTA: trap trace register accesses. These are not context switched.
+ * - TCPAC: not set, CPACR_EL1 is context-switched per VCPU.
+ * - TAM: trap access to the activity monitor registers. RES0 when the feature
+ *   is not present, but writing 1 cannot affect operation in that case.
+ * - All other bits are RES0 or part of CPTR_EL2_RES1.
+ * - E0POE, SMEN, FPEN, ZEN: exist only in the E2H1 variant.
+ */
+#define CPTR_EL2_DEFAULT    (CPTR_EL2_RES1 | BIT(CPTR_EL2_TTA) | BIT(CPTR_EL2_TFP) | BIT(CPTR_EL2_TAM))
 
 #define SCTLR_EL1_UCI       BIT(26)     /* Enable EL0 access to DC CVAU, DC CIVAC, DC CVAC,
                                            and IC IVAU in AArch64 state   */
 #define SCTLR_EL1_C         BIT(2)      /* Enable data and unified caches */
 #define SCTLR_EL1_I         BIT(12)     /* Enable instruction cache       */
 #define SCTLR_EL1_CP15BEN   BIT(5)      /* AArch32 CP15 barrier enable    */
-#define SCTLR_EL1_UTC       BIT(15)     /* Enable EL0 access to CTR_EL0   */
+#define SCTLR_EL1_UCT       BIT(15)     /* Enable EL0 access to CTR_EL0   */
 #define SCTLR_EL1_NTWI      BIT(16)     /* WFI executed as normal         */
 #define SCTLR_EL1_NTWE      BIT(18)     /* WFE executed as normal         */
+
+#ifdef CONFIG_AARCH64_USER_CACHE_ENABLE
+#define SCTLR_NATIVE_USER_CACHE_OPS (SCTLR_EL1_UCI | SCTLR_EL1_UCT)
+#else
+#define SCTLR_NATIVE_USER_CACHE_OPS
+#endif
 
 /* Disable MMU, SP alignment check, and alignment check */
 /* A57 default value */
 #define SCTLR_EL1_RES      0x30d00800   /* Reserved value */
-#define SCTLR_EL1          ( SCTLR_EL1_RES | SCTLR_EL1_CP15BEN | SCTLR_EL1_UTC \
-                           | SCTLR_EL1_NTWI | SCTLR_EL1_NTWE )
-#define SCTLR_EL1_NATIVE   (SCTLR_EL1 | SCTLR_EL1_C | SCTLR_EL1_I | SCTLR_EL1_UCI)
-#define SCTLR_EL1_VM       (SCTLR_EL1 | SCTLR_EL1_UCI)
+#define SCTLR_EL1          ( SCTLR_EL1_RES | SCTLR_EL1_CP15BEN | \
+                             SCTLR_EL1_NTWI | SCTLR_EL1_NTWE )
+#define SCTLR_EL1_NATIVE   (SCTLR_EL1 | SCTLR_EL1_C | SCTLR_EL1_I | SCTLR_NATIVE_USER_CACHE_OPS)
+#define SCTLR_EL1_VM       (SCTLR_EL1 | SCTLR_EL1_UCT | SCTLR_EL1_UCI)
 #define SCTLR_DEFAULT      SCTLR_EL1_NATIVE
+
+/* TCR_EL1 for native threads. Stage 1 translation is off, but fields like
+ * TBI0/TBI1 still apply to EL0. 0 is a safe EL0 value for all relevant fields.
+ */
+#define TCR_EL1_NATIVE     0
 
 #define UNKNOWN_FAULT       0x2000000
 #define ESR_EC_TFP          0x7         /* Trap instructions that access FPU registers */
@@ -97,26 +218,31 @@
 #define REG_MAIR_EL1        "mair_el1"
 #define REG_AMAIR_EL1       "amair_el1"
 #define REG_CONTEXTIDR_EL1  "contextidr_el1"
-#define REG_ACTLR_EL1       "actlr_el1"
 #define REG_AFSR0_EL1       "afsr0_el1"
 #define REG_AFSR1_EL1       "afsr1_el1"
 #define REG_ESR_EL1         "esr_el1"
 #define REG_FAR_EL1         "far_el1"
-#define REG_ISR_EL1         "isr_el1"
 #define REG_VBAR_EL1        "vbar_el1"
 #define REG_TPIDR_EL1       "tpidr_el1"
 #define REG_SP_EL1          "sp_el1"
 #define REG_ELR_EL1         "elr_el1"
 #define REG_SPSR_EL1        "spsr_el1"
 #define REG_CPACR_EL1       "cpacr_el1"
+#define REG_PAR_EL1         "par_el1"
 #define REG_CNTV_TVAL_EL0   "cntv_tval_el0"
 #define REG_CNTV_CTL_EL0    "cntv_ctl_el0"
 #define REG_CNTV_CVAL_EL0   "cntv_cval_el0"
 #define REG_CNTVOFF_EL2     "cntvoff_el2"
 #define REG_CNTKCTL_EL1     "cntkctl_el1"
 #define REG_HCR_EL2         "hcr_el2"
+#define REG_CPTR_EL2        "cptr_el2"
 #define REG_VTCR_EL2        "vtcr_el2"
 #define REG_VMPIDR_EL2      "vmpidr_el2"
+#define REG_CSSELR_EL1      "csselr_el1"
+/* Use generic encoding to avoid needing FEAT_RAS assembler feature */
+#define REG_VDISR_EL2       "s3_4_c12_c1_1"
+#define REG_ID_AA64PFR0_EL1 "id_aa64pfr0_el1"
+#define REG_MPIDR_EL1       "mpidr_el1"
 #define REG_ID_AA64MMFR0_EL1 "id_aa64mmfr0_el1"
 
 /* for EL1 SCTLR */
@@ -190,6 +316,8 @@ static inline void writeAMAIR(word_t reg)
     MSR(REG_AMAIR_EL1, reg);
 }
 
+/** MODIFIES: */
+/** DONT_TRANSLATE */
 static inline word_t readCIDR(void)
 {
     uint32_t reg;
@@ -197,23 +325,15 @@ static inline word_t readCIDR(void)
     return (word_t)reg;
 }
 
+/** MODIFIES: phantom_machine_state */
+/** DONT_TRANSLATE */
 static inline void writeCIDR(word_t reg)
 {
     MSR(REG_CONTEXTIDR_EL1, (uint32_t)reg);
 }
 
-static inline word_t readACTLR(void)
-{
-    word_t reg;
-    MRS(REG_ACTLR_EL1, reg);
-    return reg;
-}
-
-static inline void writeACTLR(word_t reg)
-{
-    MSR(REG_ACTLR_EL1, reg);
-}
-
+/** MODIFIES: */
+/** DONT_TRANSLATE */
 static inline word_t readAFSR0(void)
 {
     uint32_t reg;
@@ -221,11 +341,15 @@ static inline word_t readAFSR0(void)
     return (word_t)reg;
 }
 
+/** MODIFIES: phantom_machine_state */
+/** DONT_TRANSLATE */
 static inline void writeAFSR0(word_t reg)
 {
     MSR(REG_AFSR0_EL1, (uint32_t)reg);
 }
 
+/** MODIFIES: */
+/** DONT_TRANSLATE */
 static inline word_t readAFSR1(void)
 {
     uint32_t reg;
@@ -233,11 +357,15 @@ static inline word_t readAFSR1(void)
     return (word_t)reg;
 }
 
+/** MODIFIES: phantom_machine_state */
+/** DONT_TRANSLATE */
 static inline void writeAFSR1(word_t reg)
 {
     MSR(REG_AFSR1_EL1, (uint32_t)reg);
 }
 
+/** MODIFIES: */
+/** DONT_TRANSLATE */
 static inline word_t readESR(void)
 {
     uint32_t reg;
@@ -245,6 +373,8 @@ static inline word_t readESR(void)
     return (word_t)reg;
 }
 
+/** MODIFIES: phantom_machine_state */
+/** DONT_TRANSLATE */
 static inline void writeESR(word_t reg)
 {
     MSR(REG_ESR_EL1, (uint32_t)reg);
@@ -260,14 +390,6 @@ static inline word_t readFAR(void)
 static inline void writeFAR(word_t reg)
 {
     MSR(REG_FAR_EL1, reg);
-}
-
-/* ISR is read-only */
-static inline word_t readISR(void)
-{
-    uint32_t reg;
-    MRS(REG_ISR_EL1, reg);
-    return (word_t)reg;
 }
 
 static inline word_t readVBAR(void)
@@ -328,6 +450,18 @@ static inline word_t readCPACR_EL1(void)
 static inline void writeCPACR_EL1(word_t reg)
 {
     MSR(REG_CPACR_EL1, reg);
+}
+
+static inline word_t readPAR_EL1(void)
+{
+    word_t reg;
+    MRS(REG_PAR_EL1, reg);
+    return reg;
+}
+
+static inline void writePAR_EL1(word_t reg)
+{
+    MSR(REG_PAR_EL1, reg);
 }
 
 static inline word_t readCNTV_TVAL_EL0(void)
@@ -402,6 +536,48 @@ static inline void writeVMPIDR_EL2(word_t reg)
     MSR(REG_VMPIDR_EL2, reg);
 }
 
+static inline word_t readCSSELR_EL1(void)
+{
+    word_t reg;
+    MRS(REG_CSSELR_EL1, reg);
+    return reg;
+}
+
+static inline void writeCSSELR_EL1(word_t reg)
+{
+    MSR(REG_CSSELR_EL1, reg);
+}
+
+static inline bool_t cpu_has_ras(void)
+{
+    word_t reg;
+    MRS(REG_ID_AA64PFR0_EL1, reg);
+    return ((reg >> ID_AA64PFR0_EL1_RAS) & MASK(4)) != 0;
+}
+
+/* VDISR_EL2 is undefined when FEAT_RAS is not supported. In this case, return 0 for read. */
+static inline word_t readVDISR_EL2(void)
+{
+    word_t reg = 0;
+    if (cpu_has_ras()) {
+        MRS(REG_VDISR_EL2, reg);
+    }
+    return reg;
+}
+
+/* VDISR_EL2 is undefined when FEAT_RAS is not supported. In this case, ignore writes. */
+static inline void writeVDISR_EL2(word_t reg)
+{
+    if (cpu_has_ras()) {
+        MSR(REG_VDISR_EL2, reg);
+    }
+}
+
+static inline void setHCR(word_t reg)
+{
+    MSR(REG_HCR_EL2, reg);
+}
+
 static word_t vcpu_hw_read_reg(word_t reg_index)
 {
     word_t reg = 0;
@@ -420,10 +596,10 @@ static word_t vcpu_hw_read_reg(word_t reg_index)
         return readAMAIR();
     case seL4_VCPUReg_CIDR:
         return readCIDR();
-    case seL4_VCPUReg_ACTLR:
-        return readACTLR();
     case seL4_VCPUReg_CPACR:
         return readCPACR_EL1();
+    case seL4_VCPUReg_PAR:
+        return readPAR_EL1();
     case seL4_VCPUReg_AFSR0:
         return readAFSR0();
     case seL4_VCPUReg_AFSR1:
@@ -432,8 +608,6 @@ static word_t vcpu_hw_read_reg(word_t reg_index)
         return readESR();
     case seL4_VCPUReg_FAR:
         return readFAR();
-    case seL4_VCPUReg_ISR:
-        return readISR();
     case seL4_VCPUReg_VBAR:
         return readVBAR();
     case seL4_VCPUReg_TPIDR_EL1:
@@ -444,6 +618,10 @@ static word_t vcpu_hw_read_reg(word_t reg_index)
         return readELR_EL1();
     case seL4_VCPUReg_SPSR_EL1:
         return readSPSR_EL1();
+    case seL4_VCPUReg_CSSELR_EL1:
+        return readCSSELR_EL1();
+    case seL4_VCPUReg_VDISR_EL2:
+        return readVDISR_EL2();
     case seL4_VCPUReg_CNTV_CTL:
         return readCNTV_CTL_EL0();
     case seL4_VCPUReg_CNTV_CVAL:
@@ -452,10 +630,8 @@ static word_t vcpu_hw_read_reg(word_t reg_index)
         return readCNTVOFF_EL2();
     case seL4_VCPUReg_CNTKCTL_EL1:
         return readCNTKCTL_EL1();
-#ifdef ENABLE_SMP_SUPPORT
     case seL4_VCPUReg_VMPIDR_EL2:
         return readVMPIDR_EL2();
-#endif /* ENABLE_SMP_SUPPORT */
     default:
         fail("ARM/HYP: Invalid register index");
     }
@@ -467,63 +643,86 @@ static void vcpu_hw_write_reg(word_t reg_index, word_t reg)
 {
     switch (reg_index) {
     case seL4_VCPUReg_SCTLR:
-        return setSCTLR(reg);
+        setSCTLR(reg);
+        break;
     case seL4_VCPUReg_TTBR0:
-        return writeTTBR0(reg);
+        writeTTBR0(reg);
+        break;
     case seL4_VCPUReg_TTBR1:
-        return writeTTBR1(reg);
+        writeTTBR1(reg);
+        break;
     case seL4_VCPUReg_TCR:
-        return writeTCR(reg);
+        writeTCR(reg);
+        break;
     case seL4_VCPUReg_MAIR:
-        return writeMAIR(reg);
+        writeMAIR(reg);
+        break;
     case seL4_VCPUReg_AMAIR:
-        return writeAMAIR(reg);
+        writeAMAIR(reg);
+        break;
     case seL4_VCPUReg_CIDR:
-        return writeCIDR(reg);
-    case seL4_VCPUReg_ACTLR:
-        return writeACTLR(reg);
+        writeCIDR(reg);
+        break;
     case seL4_VCPUReg_CPACR:
-        return writeCPACR_EL1(reg);
+        writeCPACR_EL1(reg);
+        break;
+    case seL4_VCPUReg_PAR:
+        writePAR_EL1(reg);
+        break;
     case seL4_VCPUReg_AFSR0:
-        return writeAFSR0(reg);
+        writeAFSR0(reg);
+        break;
     case seL4_VCPUReg_AFSR1:
-        return writeAFSR1(reg);
+        writeAFSR1(reg);
+        break;
     case seL4_VCPUReg_ESR:
-        return writeESR(reg);
+        writeESR(reg);
+        break;
     case seL4_VCPUReg_FAR:
-        return writeFAR(reg);
-    case seL4_VCPUReg_ISR:
-        /* ISR is read-only */
-        return;
+        writeFAR(reg);
+        break;
     case seL4_VCPUReg_VBAR:
-        return writeVBAR(reg);
+        writeVBAR(reg);
+        break;
     case seL4_VCPUReg_TPIDR_EL1:
-        return writeTPIDR_EL1(reg);
+        writeTPIDR_EL1(reg);
+        break;
     case seL4_VCPUReg_SP_EL1:
-        return writeSP_EL1(reg);
+        writeSP_EL1(reg);
+        break;
     case seL4_VCPUReg_ELR_EL1:
-        return writeELR_EL1(reg);
+        writeELR_EL1(reg);
+        break;
     case seL4_VCPUReg_SPSR_EL1:
-        return writeSPSR_EL1(reg);
+        writeSPSR_EL1(reg);
+        break;
+    case seL4_VCPUReg_CSSELR_EL1:
+        writeCSSELR_EL1(reg);
+        break;
+    case seL4_VCPUReg_VDISR_EL2:
+        writeVDISR_EL2(reg);
+        break;
     case seL4_VCPUReg_CNTV_CTL:
-        return writeCNTV_CTL_EL0(reg);
+        writeCNTV_CTL_EL0(reg);
+        break;
     case seL4_VCPUReg_CNTV_CVAL:
-        return writeCNTV_CVAL_EL0(reg);
+        writeCNTV_CVAL_EL0(reg);
+        break;
     case seL4_VCPUReg_CNTVOFF:
-        return writeCNTVOFF_EL2(reg);
+        writeCNTVOFF_EL2(reg);
+        break;
     case seL4_VCPUReg_CNTKCTL_EL1:
-        return writeCNTKCTL_EL1(reg);
-#ifdef ENABLE_SMP_SUPPORT
+        writeCNTKCTL_EL1(reg);
+        break;
     case seL4_VCPUReg_VMPIDR_EL2:
-        return writeVMPIDR_EL2(reg);
-#endif /* ENABLE_SMP_SUPPORT */
+        writeVMPIDR_EL2(reg);
+        break;
     default:
         fail("ARM/HYP: Invalid register index");
     }
-
-    return;
 }
 
+/** DONT_TRANSLATE */
 static inline void vcpu_init_vtcr(void)
 {
 
@@ -573,27 +772,39 @@ static inline void armv_vcpu_boot_init(void)
     MSR(REG_HCR_EL2, hcr_el2);
     isb();
 
-    /* set the SCTLR_EL1 for running native seL4 threads */
+    /* Trap EL0 and EL1 FPU, SVE, SME and trace accesses to EL2. FPU init later
+     * in init_cpu() enables FPU as needed. */
+    MSR(REG_CPTR_EL2, CPTR_EL2_DEFAULT);
+    /* isb() below is enough, we are not making a change that is relevant to EL2 access */
+
+    /* set the SCTLR_EL1 and TCR_EL1 for running native seL4 threads */
     MSR(REG_SCTLR_EL1, SCTLR_EL1_NATIVE);
+    MSR(REG_TCR_EL1, TCR_EL1_NATIVE);
     isb();
+
+    initHDCR();
 }
 
-static inline void armv_vcpu_save(vcpu_t *vcpu, UNUSED bool_t active)
+static inline void armv_vcpu_save(vcpu_t *vcpu, bool_t active)
 {
-    vcpu_save_reg_range(vcpu, seL4_VCPUReg_TTBR0, seL4_VCPUReg_SPSR_EL1);
+    /* If we aren't active then this state already got stored when we were disabled */
+    if (active) {
+        vcpu_save_reg(vcpu, seL4_VCPUReg_CPACR);
+        vcpu_save_reg(vcpu, seL4_VCPUReg_TCR);
+    }
+    vcpu_save_reg_range(vcpu, seL4_VCPURegSaveRange_start, seL4_VCPURegSaveRange_end);
 }
 
 static inline void vcpu_enable(vcpu_t *vcpu)
 {
-    MSR(REG_HCR_EL2, HCR_VCPU);
-    isb();
+    vcpu_restore_reg(vcpu, seL4_VCPUReg_TCR);
     vcpu_restore_reg(vcpu, seL4_VCPUReg_SCTLR);
+    setHCR(HCR_VCPU);
     isb();
 
     set_gic_vcpu_ctrl_hcr(vcpu->vgic.hcr);
-#ifdef CONFIG_HAVE_FPU
+
     vcpu_restore_reg(vcpu, seL4_VCPUReg_CPACR);
-#endif
     /* Restore virtual timer state */
     restore_virt_timer(vcpu);
 }
@@ -607,34 +818,30 @@ static inline void vcpu_disable(vcpu_t *vcpu)
         hcr = get_gic_vcpu_ctrl_hcr();
         vcpu->vgic.hcr = hcr;
         vcpu_save_reg(vcpu, seL4_VCPUReg_SCTLR);
-#ifdef CONFIG_HAVE_FPU
         vcpu_save_reg(vcpu, seL4_VCPUReg_CPACR);
-#endif
-        isb();
+        vcpu_save_reg(vcpu, seL4_VCPUReg_TCR);
     }
     /* Turn off the VGIC */
     set_gic_vcpu_ctrl_hcr(0);
-    isb();
+    /* for GIC memory-mapped register */
+    dsb();
 
     /* Stage 1 MMU off */
     setSCTLR(SCTLR_DEFAULT);
-    isb();
-    MSR(REG_HCR_EL2, HCR_NATIVE);
+    /* Guest TBI settings would otherwise apply to native threads */
+    writeTCR(TCR_EL1_NATIVE);
+    setHCR(HCR_NATIVE);
     isb();
 
-#ifdef CONFIG_HAVE_FPU
     /* Allow FPU instructions in EL0 and EL1 for native
      * threads by setting the CPACR_EL1. The CPTR_EL2 is
      * used to trap the FPU instructions to EL2.
      */
     enableFpuEL01();
-#endif
-    if (likely(vcpu)) {
-        /* Save virtual timer state */
-        save_virt_timer(vcpu);
-        /* Mask the virtual timer interrupt */
-        maskInterrupt(true, CORE_IRQ_TO_IRQT(CURRENT_CPU_INDEX(), INTERRUPT_VTIMER_EVENT));
-    }
+    /* Save virtual timer state if there is a VCPU, and stop the timer */
+    disable_virt_timer(vcpu);
+    /* Mask the virtual timer interrupt */
+    maskInterrupt(true, CORE_IRQ_TO_IRQT(CURRENT_CPU_INDEX(), INTERRUPT_VTIMER_EVENT));
 }
 
 static inline void armv_vcpu_init(vcpu_t *vcpu)
@@ -644,10 +851,9 @@ static inline void armv_vcpu_init(vcpu_t *vcpu)
 
 static inline bool_t armv_handleVCPUFault(word_t hsr)
 {
-#ifdef CONFIG_HAVE_FPU
-    if ((ESR_EC(hsr) == ESR_EC_TFP || ESR_EC(hsr) == ESR_EC_CPACR) && !isFpuEnable()) {
-        handleFPUFault();
-        setNextPC(NODE_STATE(ksCurThread), getRestartPC(NODE_STATE(ksCurThread)));
+#ifdef CONFIG_HARDWARE_DEBUG_API
+    if (isDebugFault(hsr)) {
+        handleDebugFaultEvent(hsr);
         return true;
     }
 #endif
@@ -658,6 +864,22 @@ static inline bool_t armv_handleVCPUFault(word_t hsr)
     }
 
     return false;
+}
+
+static inline bool_t vcpu_reg_saved_when_disabled(word_t field)
+{
+    switch (field) {
+    case seL4_VCPUReg_SCTLR:
+    case seL4_VCPUReg_CNTV_CTL:
+    case seL4_VCPUReg_CNTV_CVAL:
+    case seL4_VCPUReg_CNTVOFF:
+    case seL4_VCPUReg_CNTKCTL_EL1:
+    case seL4_VCPUReg_CPACR:
+    case seL4_VCPUReg_TCR:
+        return true;
+    default:
+        return false;
+    }
 }
 
 #endif /* End of CONFIG_ARM_HYPERVISOR_SUPPORT */

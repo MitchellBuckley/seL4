@@ -11,6 +11,26 @@
 
 #ifdef CONFIG_ARM_HYPERVISOR_SUPPORT
 
+/** Returns the full 64-bit VTTBR (stage 2 translation table base and VMID).
+ *
+ * Mark as ignored for the C parser, because of the two outputs of the same asm block.
+ */
+/** MODIFIES: */
+/** DONT_TRANSLATE */
+static inline uint64_t getVTTBR(void)
+{
+    word_t lo, hi;
+    asm volatile("mrrc p15, 6, %0, %1, c2" : "=r"(lo), "=r"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/** Sets the full 64-bit VTTBR (stage 2 translation table base and VMID). */
+static inline void setVTTBR(uint64_t vttbr)
+{
+    asm volatile("mcrr p15, 6, %0, %1, c2" : : "r"((word_t)vttbr), "r"((word_t)(vttbr >> 32)));
+    isb();
+}
+
 /** Sets the VMID for the current stage 2 address space.
  *
  * This will update the current VMID in VTTBR while preserving the
@@ -24,33 +44,10 @@ static inline void writeContextIDPL2(word_t id)
     isb();
 }
 
-/** Sets the stage 2 translation table base address and VMID.
- *
- * The only difference between this and setCurrentPDPL2() is that
- * the latter preserves the VMID.
- */
+/** Sets the stage 2 translation table base address and VMID. */
 static inline void writeContextIDAndPD(word_t id, word_t pd_val)
 {
-    asm volatile("mcrr p15, 6, %0, %1, c2"  : : "r"(pd_val), "r"(id << (48-32)));
-    isb();
-}
-
-/** Sets the stage 2 translation table base address.
- *
- * "P15, 6, <r0>, <r1>, c2" refers to the VTTBR register.
- *
- * VTTBR can only be accessed in hyp mode (or monitor mode with SCR.NS==1).
- * It sets the physical address of the page tables that the CPU will walk
- * for stage 2 translation. It also sets the VMID of the current stage 2
- * address space.
- */
-static inline void setCurrentPDPL2(paddr_t addr)
-{
-    word_t pd_val, vmid;
-    asm volatile("mrrc p15, 6, %0, %1, c2" : "=r"(pd_val), "=r"(vmid));
-    dsb();
-    asm volatile("mcrr p15, 6, %0, %1, c2" : : "r"(addr), "r"(vmid));
-    isb();
+    setVTTBR(((uint64_t)id << 48) | pd_val);
 }
 
 static inline void setCurrentHypPD(paddr_t addr)
@@ -82,6 +79,46 @@ static inline word_t getHCR(void)
     return HCR;
 }
 
+#ifdef CONFIG_ARCH_ARM_V8A
+/* HCR2 only exists on ARMv8-A (FEAT_AA32EL2); the encoding is unallocated on
+ * ARMv7-A. */
+static inline void setHCR2(word_t r)
+{
+    dsb();
+    asm volatile("mcr p15, 4, %0, c1, c1, 4" : : "r"(r));
+    isb();
+}
+#endif
+
+#define HCPTR_TCP10  BIT(10)
+#define HCPTR_TCP11  BIT(11)
+#define HCPTR_TASE   BIT(15)
+#define HCPTR_TTA    BIT(20)
+#define HCPTR_TAM    BIT(30)
+#define HCPTR_TCPAC  BIT(31)
+
+/* HCPTR value set at boot. PL0 and PL1 coprocessor accesses trap to Hyp mode
+ * unless enabled explicitly.
+ *
+ * - TCP0-TCP9, TCP12, TCP13: trap accesses to IMPLEMENTATION DEFINED and
+ *   reserved coprocessors. RAO/WI when not implemented.
+ * - TCP10, TCP11, TASE: trap VFP and Advanced SIMD. With CONFIG_HAVE_FPU,
+ *   enableFpuInstInHyp() clears these bits while the FPU is enabled. Without
+ *   CONFIG_HAVE_FPU, the FPU is not context switched and all accesses are
+ *   trapped.
+ * - TTA: trap PL0 and PL1 accesses to CP14 trace registers. These are not
+ *   context switched.
+ * - TCPAC: not set, CPACR is saved and restored per VCPU.
+ * - TAM: trap accesses to AMU registers. These are not context switched.
+ *   RES0 when not implemented, but writing 1 must not affect operation.
+ * - All other bits are RES0. */
+#define HCPTR_DEFAULT (MASK(14) | HCPTR_TASE | HCPTR_TTA | HCPTR_TAM)
+
+/* HCPTR trap bits for VFP and Advanced SIMD. When set, PL0 and PL1 accesses
+ * trap to Hyp mode and Hyp mode accesses are UNDEFINED, so the kernel must
+ * clear them before it executes VFP instructions. */
+#define HCPTR_FPU_TRAPS (HCPTR_TCP10 | HCPTR_TCP11 | HCPTR_TASE)
+
 static inline void setHCPTR(word_t r)
 {
     dsb();
@@ -94,6 +131,20 @@ static inline word_t PURE getHCPTR(void)
     word_t HCPTR;
     asm volatile("mrc p15, 4, %0, c1, c1, 2" : "=r"(HCPTR));
     return HCPTR;
+}
+
+static inline void setHSTR(word_t r)
+{
+    dsb();
+    asm volatile("mcr p15, 4, %0, c1, c1, 3" : : "r"(r));
+    isb();
+}
+
+static inline word_t PURE getHSTR(void)
+{
+    word_t HSTR;
+    asm volatile("mrc p15, 4, %0, c1, c1, 3" : "=r"(HSTR));
+    return HSTR;
 }
 
 static inline void setHMAIR(word_t hmair0, word_t hmair1)
@@ -118,12 +169,18 @@ static inline void invalidateHypTLB(void)
     isb();
 }
 
-static inline paddr_t PURE addressTranslateS1CPR(vptr_t vaddr)
+static inline paddr_t addressTranslateS1(vptr_t vaddr)
 {
     uint32_t ipa0, ipa1;
+    uint32_t saved_ipa0, saved_ipa1;
+
+    asm volatile("mrrc p15, 0, %0, %1, c7"   : "=r"(saved_ipa0), "=r"(saved_ipa1));
+
     asm volatile("mcr  p15, 0, %0, c7, c8, 0" :: "r"(vaddr));
     isb();
     asm volatile("mrrc p15, 0, %0, %1, c7"   : "=r"(ipa0), "=r"(ipa1));
+
+    asm volatile("mcrr p15, 0, %0, %1, c7"   :: "r"(saved_ipa0), "r"(saved_ipa1));
 
     return ipa0;
 }
@@ -173,26 +230,14 @@ static inline void writeHTPIDR(word_t reg)
     asm volatile("mcr p15, 4, %0, c13, c0, 2" :: "r"(reg));
 }
 
-static inline word_t readHTPIDR(void)
-{
-    word_t reg;
-    asm volatile("mrc p15, 4, %0, c13, c0, 2" : "=r"(reg));
-    return reg;
-}
-
 #else
 
 /* used in other files without guards */
-static inline void setCurrentPDPL2(paddr_t pa) {}
 static inline void invalidateHypTLB(void) {}
 static inline void writeContextIDPL2(word_t pd_val) {}
 static inline void writeContextIDAndPD(word_t id, word_t pd_val) {}
 static inline void writeHTPIDR(word_t htpidr) {}
-static inline word_t readHTPIDR(void)
-{
-    return 0;
-}
-static inline paddr_t addressTranslateS1CPR(vptr_t vaddr)
+static inline paddr_t addressTranslateS1(vptr_t vaddr)
 {
     return vaddr;
 }

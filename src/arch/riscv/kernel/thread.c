@@ -22,7 +22,7 @@ void Arch_switchToThread(tcb_t *tcb)
 
 BOOT_CODE void Arch_configureIdleThread(tcb_t *tcb)
 {
-    setRegister(tcb, NextIP, (word_t)idleThreadStart);
+    setRegister(tcb, NextIP, (word_t)&idle_thread);
 
     /* Enable interrupts and keep working in supervisor mode */
     setRegister(tcb, SSTATUS, (word_t) SSTATUS_SPP | SSTATUS_SPIE);
@@ -54,4 +54,14 @@ void Arch_activateIdleThread(tcb_t *tcb)
 void Arch_postModifyRegisters(tcb_t *tptr)
 {
     /* Nothing to do */
+}
+
+void Arch_prepareNextDomain(void)
+{
+    /* Don't need to do anything */
+}
+
+void Arch_prepareSetDomain(tcb_t *tptr, dom_t dom)
+{
+    /* Don't need to do anything */
 }

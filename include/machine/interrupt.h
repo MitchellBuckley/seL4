@@ -16,7 +16,7 @@
  * kernel to track irq state. An irq_t is also used to interface with an
  * interrupt controller driver using the functions below.
  * For most configurations an irq_t is a word_t type and the irq_t values
- * directly map to harware irq numbers and are also used as indexes into the
+ * directly map to hardware irq numbers and are also used as indexes into the
  * kernel's irq cnode that it uses for tracking state.
  * However on SMP configurations where there can be multiple irq_t identifiers
  * for a single hardware irq number, such as when there are core local interrupts,
@@ -80,7 +80,7 @@ static inline bool_t isIRQPending(void);
  * When an IRQ is disabled, it should not raise an interrupt on the processor.
  *
  * @param[in]  disable  True to disable IRQ, False to enable IRQ
- * @param[in]  irq      The irq to modify
+ * @param[in]  irq      The IRQ to modify
  */
 static inline void maskInterrupt(bool_t disable, irq_t irq);
 
@@ -93,14 +93,28 @@ static inline void maskInterrupt(bool_t disable, irq_t irq);
  * but before user level has handled the cause and does not imply that the cause
  * of the interrupt has been handled.
  *
- * @param[in]  irq   irq to ack
+ * @param[in]  irq   IRQ to ack
  */
 static inline void ackInterrupt(irq_t irq);
 
 /**
+ * Deactivates the interrupt
+ *
+ * When the interrupt controller supports delegating the interrupt to a lower
+ * privilege level, this function can be called to signal the completion of
+ * interrupt processing so that the interrupt state machine can be moved out of
+ * the active state.
+ *
+ * Currently only supported by gicv3 driver.
+ *
+ * @param[in]  irq   The interrupt request
+ */
+static inline void deactivateInterrupt(irq_t irq);
+
+/**
  * Called when getActiveIRQ returns irqInvalid while the kernel is handling an
  * interrupt entry. An implementation is not required to do anything here, but
- * can report the spurious IRQ or try prevent it from reoccuring.
+ * can report the spurious IRQ or try prevent it from reoccurring.
  */
 static inline void handleSpuriousIRQ(void);
 
@@ -116,3 +130,8 @@ static inline void handleSpuriousIRQ(void);
  */
 static inline void handleReservedIRQ(irq_t irq);
 
+void setIRQTrigger(irq_t irq, bool_t trigger);
+
+#ifndef CONFIG_ARM_GIC_V3_SUPPORT
+static inline void deactivateInterrupt(irq_t irq) {}
+#endif

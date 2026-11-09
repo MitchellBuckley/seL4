@@ -26,13 +26,14 @@
 #define CNT_TVAL "cnthp_tval_el2"
 #define CNT_CVAL "cnthp_cval_el2"
 #define CNT_CTL  "cnthp_ctl_el2"
+#define CNT_CT   "cntpct_el0"
 #else
 #define CNT_TVAL "cntv_tval_el0"
 #define CNT_CVAL "cntv_cval_el0"
 #define CNT_CTL  CNTV_CTL
+#define CNT_CT   "cntvct_el0"
 #endif
 #define CNTFRQ   "cntfrq_el0"
-#define CNT_CT   "cntvct_el0"
 
 #ifdef ENABLE_SMP_SUPPORT
 /* Use the first two SGI (Software Generated Interrupt) IDs
@@ -50,6 +51,13 @@ static inline word_t getProcessorID(void)
     word_t processor_id;
     MRS("midr_el1", processor_id);
     return processor_id;
+}
+
+static inline word_t readCTR(void)
+{
+    word_t ctr;
+    MRS("ctr_el0", ctr);
+    return ctr;
 }
 
 static inline word_t readSystemControlRegister(void)
@@ -81,23 +89,9 @@ static inline void writeTPIDR_EL0(word_t reg)
     MSR("tpidr_el0", reg);
 }
 
-static inline word_t readTPIDR_EL0(void)
-{
-    word_t reg;
-    MRS("tpidr_el0", reg);
-    return reg;
-}
-
 static inline void writeTPIDRRO_EL0(word_t reg)
 {
     MSR("tpidrro_el0", reg);
-}
-
-static inline word_t readTPIDRRO_EL0(void)
-{
-    word_t reg;
-    MRS("tpidrro_el0", reg);
-    return reg;
 }
 
 static inline void writeTPIDR_EL1(word_t reg)
@@ -110,12 +104,6 @@ static inline word_t readTPIDR_EL1(void)
     word_t reg;
     MRS("tpidr_el1", reg);
     return reg;
-}
-
-static void arm_save_thread_id(tcb_t *thread)
-{
-    setRegister(thread, TPIDR_EL0, readTPIDR_EL0());
-    setRegister(thread, TPIDRRO_EL0, readTPIDRRO_EL0());
 }
 
 static void arm_load_thread_id(tcb_t *thread)
@@ -158,6 +146,26 @@ static inline bool_t checkTCR_EL2(void)
     MRS("tcr_el2", tcr_el2);
 
     return (tcr_el2 == TCR_EL2_DEFAULT);
+}
+
+/* Supported ASID size field of ID_AA64MMFR0_EL1 */
+#define ID_AA64MMFR0_EL1_ASIDBITS(x)  (((x) >> 4) & 0xf)
+#define ID_AA64MMFR0_EL1_ASIDBITS_16  2
+/* Selected ASID size in TCR_EL1 */
+#define TCR_EL1_AS                    BIT(36)
+
+/* For non-hyp AArch64 configs, check that 16-bit ASIDs are supported
+ * and enabled. */
+static inline bool_t check16BitASID(void)
+{
+    word_t id_aa64mmfr0_el1 = 0;
+    word_t tcr_el1 = 0;
+
+    MRS("id_aa64mmfr0_el1", id_aa64mmfr0_el1);
+    MRS("tcr_el1", tcr_el1);
+
+    return ID_AA64MMFR0_EL1_ASIDBITS(id_aa64mmfr0_el1) == ID_AA64MMFR0_EL1_ASIDBITS_16 &&
+           (tcr_el1 & TCR_EL1_AS);
 }
 
 static inline void setCurrentKernelVSpaceRoot(ttbr_t ttbr)
@@ -303,8 +311,11 @@ static inline void invalidateByVA_I(vptr_t vaddr, paddr_t paddr)
 
 static inline void invalidate_I_PoU(void)
 {
+#ifdef CONFIG_ENABLE_SMP_SUPPORT
+    asm volatile("ic ialluis");
+#else
     asm volatile("ic iallu");
-    isb();
+#endif
 }
 
 static inline void cleanInvalByVA(vptr_t vaddr, paddr_t paddr)
@@ -346,6 +357,7 @@ static inline word_t ats1e2r(word_t va)
 {
     word_t par;
     asm volatile("at s1e2r, %0" :: "r"(va));
+    isb();
     MRS("par_el1", par);
     return par;
 }
@@ -354,6 +366,7 @@ static inline word_t ats1e1r(word_t va)
 {
     word_t par;
     asm volatile("at s1e1r, %0" :: "r"(va));
+    isb();
     MRS("par_el1", par);
     return par;
 }
@@ -363,6 +376,7 @@ static inline word_t ats2e0r(word_t va)
 {
     word_t par;
     asm volatile("at s12e0r, %0" :: "r"(va));
+    isb();
     MRS("par_el1", par);
     return par;
 }
@@ -370,4 +384,20 @@ static inline word_t ats2e0r(word_t va)
 void arch_clean_invalidate_caches(void);
 void arch_clean_invalidate_L1_caches(word_t type);
 
+static inline paddr_t addressTranslateS1(vptr_t vaddr)
+{
+    word_t result;
+    UNUSED word_t saved_par;
 
+    if (config_set(CONFIG_ARM_HYPERVISOR_SUPPORT)) {
+        MRS("par_el1", saved_par);
+    }
+
+    result = ats1e1r(vaddr);
+
+    if (config_set(CONFIG_ARM_HYPERVISOR_SUPPORT)) {
+        MSR("par_el1", saved_par);
+    }
+
+    return result;
+}
